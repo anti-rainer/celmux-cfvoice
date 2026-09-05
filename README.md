@@ -45,8 +45,8 @@ Workers AI 使用绑定，不需要额外填写模型 API Key。
 4. 复制自定义域名的 HTTPS 地址，稍后填入 Celmux 的「Agent 地址」。
 
 Worker 会根据请求的来源自动返回 CORS 头，因此 Celmux 使用局域网 IP 或公网域名
-都可以访问，不需要额外配置回源地址。接口仍然必须携带 `CELMUX_AGENT_TOKEN`，不要将 Worker 地址和
-   Token 误认为可以单独作为认证。
+都可以访问，不需要额外配置回源地址。接口仍然必须携带 `CELMUX_AGENT_TOKEN`，不要将
+Worker 地址和 Token 误认为可以单独作为认证。
 
 ## Celmux 中的配置
 

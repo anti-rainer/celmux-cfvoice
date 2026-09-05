@@ -5,7 +5,6 @@
   "compatibility_date": "2026-09-02",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
-  "routes": [],
   "ai": {
     "binding": "AI",
     "remote": true
