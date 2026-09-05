@@ -1,12 +1,13 @@
 {
-  "name": "celmux-cloudflare-voice-agent",
+  "name": "celmux-cfvoice",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "wrangler deploy --keep-vars",
     "setup": "bash ./scripts/setup.sh",
+    "typecheck": "tsc --noEmit",
     "types": "wrangler types"
   },
   "dependencies": {
@@ -15,8 +16,21 @@
     "ai": "^7.0.92"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260903.1",
+    "@types/node": "^24.3.0",
     "typescript": "^5.8.2",
     "wrangler": "^4.30.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "CELMUX_AGENT_TOKEN": {
+        "description": "A random shared secret used by Celmux to authenticate Worker API requests."
+      },
+      "CLOUDFLARE_SFU_APP_ID": {
+        "description": "The App ID of your Cloudflare Realtime SFU application."
+      },
+      "CLOUDFLARE_SFU_API_TOKEN": {
+        "description": "An API token with Realtime Admin permission for the SFU application."
+      }
+    }
   }
 }

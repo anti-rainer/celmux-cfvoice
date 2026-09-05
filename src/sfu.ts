@@ -5,7 +5,7 @@ import {
 } from "@cloudflare/voice";
 import { authorized, corsHeaders, jsonError } from "./auth";
 import type { CallAccessKind, CallFeatureConfig, RoleTickets } from "./protocol";
-import type { SFUConfig } from "./sfu-api";
+import { cleanupSFUResources, type SFUConfig } from "./sfu-api";
 
 type AdapterTrack = {
   sessionId?: string;
@@ -75,13 +75,18 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
 
   const closeMatch = url.pathname.match(/^\/api\/calls\/([0-9a-f-]+)$/i);
   if (closeMatch && request.method === "DELETE") {
-    const response = await agent(env, closeMatch[1]).fetch("https://agent.internal/close", {
-      method: "POST",
-      headers: internalHeaders(env),
-    });
-    if (!response.ok) return jsonError("close_failed", 502, headers);
-    const result = await response.json<Record<string, unknown>>();
-    return Response.json(result, { headers });
+    try {
+      const response = await agent(env, closeMatch[1]).fetch("https://agent.internal/close", {
+        method: "POST",
+        headers: internalHeaders(env),
+      });
+      if (!response.ok) return jsonError("close_failed", 502, headers);
+      const result = await response.json<Record<string, unknown>>();
+      return Response.json(result, { headers });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "close_failed";
+      return jsonError(message, 502, headers);
+    }
   }
 
   const renegotiateMatch = url.pathname.match(/^\/api\/calls\/([0-9a-f-]+)\/renegotiate$/i);
@@ -127,6 +132,9 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
   }
 
   let callId = "";
+  let createdSfu: SFUConfig | null = null;
+  const createdAdapterIds: string[] = [];
+  const createdTracks: Array<{ sessionId: string; mids: string[] }> = [];
   try {
     const body = await request.json<OpenCallBody>();
     const accessKind = body.access_kind || "browser";
@@ -146,8 +154,8 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
     const callAgent = agent(env, callId);
     const transcription = body.features?.transcription === true;
     const transcriptionMode = body.features?.transcriptionMode === "chunked" ? "chunked" : "realtime";
-    const sourceLanguage = body.features?.sourceLanguage?.trim() || "auto";
-    const targetLanguage = body.features?.targetLanguage?.trim() || "zh-CN";
+    const sourceLanguage = normalizeLanguage(body.features?.sourceLanguage, "auto");
+    const targetLanguage = normalizeLanguage(body.features?.targetLanguage, "zh");
     const speechTranslation = accessKind !== "automatic"
       && transcription
       && body.features?.speechTranslation === true
@@ -187,6 +195,10 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
 
     const sfu = config(env);
     if (!sfu) throw new Error("sfu_not_configured");
+    createdSfu = sfu;
+    // Allocate sequentially so every successful resource is visible to the
+    // failure path. Promise.all would hide the successful sibling when one
+    // request rejects, leaving an adapter or session behind.
     const downlink = await createSFUWebSocketAdapter(sfu, [{
       location: "local",
       trackName: "celmux-downlink",
@@ -195,8 +207,9 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
       mode: "buffer",
     }]) as AdapterResponse;
     const downlinkTrack = downlink.tracks?.[0];
+    if (downlinkTrack?.adapterId) createdAdapterIds.push(downlinkTrack.adapterId);
     if (!downlinkTrack?.sessionId || !downlinkTrack.trackName) throw new Error("downlink_adapter_failed");
-
+    if (downlinkTrack.mid) createdTracks.push({ sessionId: downlinkTrack.sessionId, mids: [downlinkTrack.mid] });
     const browser = await createSFUSession(sfu);
     // Realtime SFU currently rejects a request that pushes and pulls tracks at
     // the same time (HTTP 406). Establish the browser uplink first, then the
@@ -205,10 +218,11 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
       sessionDescription: { type: "offer", sdp },
       tracks: [{ location: "local", mid, trackName: "browser-uplink" }],
     }) as TrackResponse;
+    const browserTrack = published.tracks?.find(track => track.trackName === "browser-uplink");
+    createdTracks.push({ sessionId: browser.sessionId, mids: [browserTrack?.mid || mid] });
     const answer = published.sessionDescription;
     if (answer?.type !== "answer" || !answer.sdp) throw new Error("sfu_answer_missing");
 
-    const browserTrack = published.tracks?.find(track => track.trackName === "browser-uplink");
     const downlinkReady = false;
     await callAgent.fetch("https://agent.internal/resources", {
       method: "POST",
@@ -222,6 +236,7 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
         downlinkTrackMid: downlinkTrack.mid || "",
         downlinkAdapterId: downlinkTrack.adapterId || "",
         uplinkAdapterId: "",
+        pendingDownlinkOfferSdp: "",
       }),
     });
 
@@ -238,12 +253,18 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
         headers: internalHeaders(env),
       }).catch(() => undefined);
     }
+    if (createdSfu) {
+      await cleanupSFUResources(createdSfu, createdAdapterIds, createdTracks);
+    }
     const message = error instanceof Error ? error.message : "sfu_request_failed";
-    console.error("Celmux Cloudflare SFU request failed", {
-      callId,
-      message,
-      stack: error instanceof Error ? error.stack : undefined,
-    });
     return Response.json({ error: "sfu_request_failed", message }, { status: 502, headers });
   }
+}
+
+function normalizeLanguage(value: unknown, fallback: string): string {
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  const normalized = value.trim().replaceAll("_", "-").toLowerCase();
+  if (normalized === "auto") return "auto";
+  if (normalized.startsWith("zh")) return "zh";
+  return normalized.split("-", 1)[0] || fallback;
 }

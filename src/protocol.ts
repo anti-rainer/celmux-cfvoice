@@ -21,6 +21,7 @@ export type PersistedCallState = CallFeatureConfig & {
   browserSessionId: string;
   browserTrackMid: string;
   browserDownlinkMid: string;
+  pendingDownlinkOfferSdp: string;
   downlinkSessionId: string;
   downlinkTrackName: string;
   downlinkTrackMid: string;

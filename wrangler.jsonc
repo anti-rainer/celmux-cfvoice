@@ -2,7 +2,7 @@
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "celmux-cfvoice",
   "main": "src/index.ts",
-  "compatibility_date": "2026-09-02",
+  "compatibility_date": "2026-09-05",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "ai": {

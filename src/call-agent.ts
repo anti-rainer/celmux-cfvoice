@@ -20,7 +20,7 @@ import {
   type RoleTickets,
 } from "./protocol";
 import { timingSafeTextEqual } from "./auth";
-import { closeSFUTracks, closeSFUWebSocketAdapters, type SFUConfig } from "./sfu-api";
+import { cleanupSFUResources, type SFUConfig } from "./sfu-api";
 
 const EMPTY_DIGESTS: Record<MediaRole, string> = {
   carrier: "",
@@ -43,6 +43,7 @@ const EMPTY_STATE: PersistedCallState = {
   browserSessionId: "",
   browserTrackMid: "",
   browserDownlinkMid: "",
+  pendingDownlinkOfferSdp: "",
   downlinkSessionId: "",
   downlinkTrackName: "",
   downlinkTrackMid: "",
@@ -103,7 +104,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       const transcription = features.transcription === true;
       const transcriptionMode = features.transcriptionMode === "chunked" ? "chunked" : "realtime";
       const sourceLanguage = normalizeLanguage(features.sourceLanguage, "auto");
-      const targetLanguage = normalizeLanguage(features.targetLanguage, "zh");
+      const targetLanguage = normalizeLanguage(features.targetLanguage, "zh-CN");
       this.closing = false;
       this.closeTask = null;
       this.sttRetryAt = { incoming: 0, outgoing: 0 };
@@ -159,6 +160,12 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       // The initial tracks request may already include the downlink. Keep
       // subscribe idempotent so older clients can safely call this endpoint
       // without triggering a needless retry/error loop.
+      if (this.state.pendingDownlinkOfferSdp) {
+        return Response.json({
+          offer: { type: "offer", sdp: this.state.pendingDownlinkOfferSdp },
+          retry: true,
+        });
+      }
       if (this.state.browserDownlinkMid) {
         return Response.json({ status: "ready", already_subscribed: true });
       }
@@ -168,32 +175,39 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         || await digest(parsedUplink.ticket) !== this.state.ticketDigests["sfu-uplink"]) {
         return new Response("Invalid uplink adapter URL", { status: 400 });
       }
-      const uplink = await createSFUWebSocketAdapter(sfu, [{
-        location: "remote",
-        sessionId: this.state.browserSessionId,
-        trackName: "browser-uplink",
-        endpoint: uplinkUrl,
-        outputCodec: "pcm",
-      }]) as {
-        errorCode?: string;
-        errorDescription?: string;
-        tracks?: Array<{
-          trackName?: string;
-          adapterId?: string;
+      let uplinkAdapterId = this.state.uplinkAdapterId;
+      if (!uplinkAdapterId) {
+        const uplink = await createSFUWebSocketAdapter(sfu, [{
+          location: "remote",
+          sessionId: this.state.browserSessionId,
+          trackName: "browser-uplink",
+          endpoint: uplinkUrl,
+          outputCodec: "pcm",
+        }]) as {
           errorCode?: string;
           errorDescription?: string;
-        }>;
-      };
-      const uplinkTrack = uplink.tracks?.[0];
-      if (!uplinkTrack?.adapterId) {
-        const detail = [
-          uplinkTrack?.errorCode || uplink.errorCode,
-          uplinkTrack?.errorDescription || uplink.errorDescription,
-        ].filter(Boolean).join(": ");
-        return new Response(
-          `Uplink adapter unavailable${detail ? `: ${detail}` : ""}`,
-          { status: 502 },
-        );
+          tracks?: Array<{
+            trackName?: string;
+            adapterId?: string;
+            errorCode?: string;
+            errorDescription?: string;
+          }>;
+        };
+        const uplinkTrack = uplink.tracks?.[0];
+        if (!uplinkTrack?.adapterId) {
+          const detail = [
+            uplinkTrack?.errorCode || uplink.errorCode,
+            uplinkTrack?.errorDescription || uplink.errorDescription,
+          ].filter(Boolean).join(": ");
+          return new Response(
+            `Uplink adapter unavailable${detail ? `: ${detail}` : ""}`,
+            { status: 502 },
+          );
+        }
+        uplinkAdapterId = uplinkTrack.adapterId;
+        // Persist immediately so a later SFU failure or retry can reuse and
+        // close this adapter instead of creating a second one.
+        this.setState({ ...this.state, uplinkAdapterId });
       }
       const subscribed = await addSFUTracks(sfu, this.state.browserSessionId, {
         tracks: [{
@@ -213,10 +227,14 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       const browserDownlink = subscribed.tracks?.find(
         track => track.trackName === this.state.downlinkTrackName,
       );
+      if (!browserDownlink?.mid) {
+        return new Response("Downlink track mid unavailable", { status: 502 });
+      }
       this.setState({
         ...this.state,
-        browserDownlinkMid: browserDownlink?.mid || "",
-        uplinkAdapterId: uplinkTrack.adapterId,
+        browserDownlinkMid: browserDownlink.mid,
+        pendingDownlinkOfferSdp: offer.sdp,
+        uplinkAdapterId,
       });
       return Response.json({ offer: { type: "offer", sdp: offer.sdp } });
     }
@@ -231,6 +249,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         return new Response("SFU subscription unavailable", { status: 409 });
       }
       await renegotiateSFUSession(sfu, this.state.browserSessionId, answer.sdp);
+      this.setState({ ...this.state, pendingDownlinkOfferSdp: "" });
       return Response.json({ status: "ready" });
     }
     if (path.endsWith("/close") && request.method === "POST") {
@@ -279,8 +298,11 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     // Original conversation audio is the real-time path. Never put an AI
     // provider send ahead of it: a congested STT socket must not delay audio.
     // Celmux has already decoded and (when necessary) repaired the carrier
-    // RTP stream. Keep the PCM continuous here and use a stateful linear 3x
-    // interpolation so the SFU Opus encoder never sees sample-hold edges.
+    // RTP stream.  Keep the PCM samples continuous here; applying a second
+    // fade at every WebSocket frame audibly softens consonant attacks and was
+    // the source of the short "zap" heard before words.  Use linear 3x
+    // interpolation instead of sample-and-hold so the 16 kHz carrier does
+    // not introduce a staircase transient before SFU's Opus encoder.
     const resampled = upsample16kMonoTo48kStereoLinear(audio, this.downlinkResampleSample);
     this.downlinkResampleSample = resampled.lastSample;
     const pcm48 = resampled.audio;
@@ -306,7 +328,9 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private feed(direction: CaptionDirection, audio: ArrayBuffer): void {
     if (!this.state.transcription) return;
     this.audioFrames[direction] += audio.byteLength / PCM16_20MS_BYTES;
-    if (hasLikelySpeechFrame(new Uint8Array(audio))) this.recentSpeechAt[direction] = Date.now();
+    if (hasLikelySpeechFrame(new Uint8Array(audio))) {
+      this.recentSpeechAt[direction] = Date.now();
+    }
     if (this.state.transcriptionMode === "chunked") {
       this.feedChunked(direction, audio);
       return;
@@ -337,6 +361,9 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private async transcribeChunk(direction: CaptionDirection, pcm: Uint8Array): Promise<void> {
     if (!this.state.transcription) return;
     if (!containsLikelySpeech(pcm)) {
+      // A blank interval separates otherwise identical real phrases. Reset
+      // deduplication without paying for Whisper or accepting its well-known
+      // subtitle hallucinations on silence/background hiss.
       this.lastChunkText[direction] = "";
       return;
     }
@@ -408,6 +435,9 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   }
 
   private hasRecentSpeech(direction: CaptionDirection): boolean {
+    // Flux finalizes after its EOT timeout. Keep a short allowance for that
+    // model/network delay, but never accept a transcript from continuous
+    // digital silence or idle microphone noise.
     return Date.now() - this.recentSpeechAt[direction] <= 4_000;
   }
 
@@ -548,6 +578,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     }
     const reader = response.body.getReader();
     let buffered = new Uint8Array(0);
+    let firstFrame = true;
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -564,12 +595,17 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
           }
           const frame = buffered.slice(0, PCM16_20MS_BYTES);
           buffered = buffered.slice(PCM16_20MS_BYTES);
+          if (firstFrame) {
+            softenPcmStart(frame);
+            firstFrame = false;
+          }
           await this.sendPacedSpeechFrame(frame, generation);
         }
       }
       if (buffered.byteLength && this.speechStreamActive(generation)) {
         const frame = new Uint8Array(PCM16_20MS_BYTES);
         frame.set(buffered);
+        if (firstFrame) softenPcmStart(frame);
         await this.sendPacedSpeechFrame(frame, generation);
       }
     } finally {
@@ -730,20 +766,35 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private async closeSfuResources(): Promise<void> {
     const sfu = sfuConfig(this.env);
     if (sfu) {
-      await Promise.allSettled([
-        closeSFUWebSocketAdapters(sfu, [
-          this.state.downlinkAdapterId,
-          this.state.uplinkAdapterId,
-        ]),
-      ]);
-      await Promise.allSettled([
-        closeSFUTracks(sfu, this.state.browserSessionId, [
-          this.state.browserTrackMid,
-          this.state.browserDownlinkMid,
-        ]),
-        closeSFUTracks(sfu, this.state.downlinkSessionId, [this.state.downlinkTrackMid]),
+      await cleanupSFUResources(sfu, [
+        this.state.downlinkAdapterId,
+        this.state.uplinkAdapterId,
+      ], [
+        {
+          sessionId: this.state.browserSessionId,
+          mids: [
+            this.state.browserTrackMid,
+            this.state.browserDownlinkMid,
+          ],
+        },
+        {
+          sessionId: this.state.downlinkSessionId,
+          mids: [this.state.downlinkTrackMid],
+        },
       ]);
     }
+  }
+}
+
+/** Apply a tiny (2 ms) linear fade-in to each synthesized utterance. Some TTS
+ * providers begin a PCM response at a non-zero sample, which is heard as a
+ * short click immediately before every translated phrase. */
+function softenPcmStart(frame: Uint8Array): void {
+  const samples = Math.min(32, Math.floor(frame.byteLength / 2));
+  const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
+  for (let index = 0; index < samples; index += 1) {
+    const gain = index / samples;
+    view.setInt16(index * 2, Math.round(view.getInt16(index * 2, true) * gain), true);
   }
 }
 
@@ -760,6 +811,9 @@ function validAccessKind(value: unknown): value is PersistedCallState["accessKin
 function normalizeLanguage(value: unknown, fallback: string): string {
   if (typeof value !== "string" || !value.trim()) return fallback;
   const normalized = value.trim().replaceAll("_", "-").toLowerCase();
+  // Whisper accepts ISO-639-1 language codes (zh, en, ...), not regional
+  // BCP-47 tags such as zh-CN. Keep the Agent state in this canonical form so
+  // both realtime Flux and chunked Whisper receive the same value.
   if (normalized === "auto") return "auto";
   if (normalized.startsWith("zh")) return "zh";
   return normalized.split("-", 1)[0] || fallback;
@@ -822,6 +876,9 @@ function hasLikelySpeechFrame(pcm: Uint8Array): boolean {
   return false;
 }
 
+/** Conservative pre-inference VAD for independent Whisper chunks. Four
+ * voiced 20 ms frames are enough to retain short words, while isolated PCM
+ * clicks and idle microphone noise never reach the generative decoder. */
 function containsLikelySpeech(pcm: Uint8Array): boolean {
   const levels: PcmLevel[] = [];
   for (let offset = 0; offset + PCM16_20MS_BYTES <= pcm.byteLength; offset += PCM16_20MS_BYTES) {
@@ -842,8 +899,14 @@ function containsLikelySpeech(pcm: Uint8Array): boolean {
   return voicedFrames >= 4 && maximumRms >= 220 && maximumSpan >= 1_000;
 }
 
-/** Convert one or more 16 kHz mono PCM frames to 48 kHz stereo PCM without
- * resetting interpolation at each 20 ms WebSocket message. */
+/** Convert one or more 16 kHz mono PCM frames to 48 kHz stereo PCM.
+ *
+ * The SFU adapter consumes signed little-endian PCM.  A sample-and-hold 3x
+ * expansion is technically valid, but its staircase edges contain a strong
+ * image in the telephone band and make consonant onsets sound like a tiny
+ * burst.  Linear interpolation keeps the same exact 20 ms clock while
+ * removing that artificial high-frequency component.
+ */
 function upsample16kMonoTo48kStereoLinear(
   mono16k: ArrayBuffer,
   previousSample: number | null,

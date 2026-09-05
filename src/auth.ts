@@ -1,11 +1,12 @@
 export function corsHeaders(request: Request, env: Env): HeadersInit {
   const origin = request.headers.get("Origin") || "";
   return {
-    // Bearer authorization protects the API; reflect the caller origin so
-    // LAN IPs and public hostnames work without extra configuration.
+    // The API is protected by the per-installation Bearer token. Reflect the
+    // requesting origin so LAN IPs and public hostnames work without an
+    // additional origin setting in Celmux.
     "Access-Control-Allow-Origin": origin || "*",
     "Access-Control-Allow-Headers": "Authorization, Content-Type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Methods": "POST, DELETE, OPTIONS",
     Vary: "Origin",
   };
 }

@@ -2,6 +2,8 @@ const SFU_API_BASE = "https://rtc.live.cloudflare.com/v1";
 
 export type SFUConfig = { appId: string; apiToken: string };
 
+export type SFUTrackRef = { sessionId: string; mids: string[] };
+
 export async function closeSFUWebSocketAdapters(config: SFUConfig, adapterIds: string[]): Promise<void> {
   const tracks = adapterIds.filter(Boolean).map(adapterId => ({ adapterId }));
   if (tracks.length === 0) return;
@@ -28,4 +30,16 @@ export async function closeSFUTracks(config: SFUConfig, sessionId: string, mids:
     body: JSON.stringify({ tracks, force: true }),
   });
   if (!response.ok) throw new Error(`SFU close failed: ${response.status}`);
+}
+
+/** Best-effort cleanup for partially-created media resources. */
+export async function cleanupSFUResources(
+  config: SFUConfig,
+  adapterIds: string[],
+  tracks: SFUTrackRef[],
+): Promise<void> {
+  await Promise.allSettled([
+    closeSFUWebSocketAdapters(config, adapterIds),
+    ...tracks.map(track => closeSFUTracks(config, track.sessionId, track.mids)),
+  ]);
 }

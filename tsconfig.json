@@ -5,8 +5,7 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "skipLibCheck": true,
-    "types": ["@cloudflare/workers-types"]
+    "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "env.d.ts"]
+  "include": ["src/**/*.ts", "env.d.ts", "worker-configuration.d.ts"]
 }
