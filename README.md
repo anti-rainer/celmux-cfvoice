@@ -44,9 +44,8 @@ Workers AI 使用绑定，不需要额外填写模型 API Key。
    对外服务地址，部分网络环境会污染或拦截该域名。
 4. 复制自定义域名的 HTTPS 地址，稍后填入 Celmux 的「Agent 地址」。
 
-`CELMUX_ALLOWED_ORIGIN` 已经移除。它不是回源地址，只是 CORS 白名单；Worker
-   会根据请求的来源自动返回 CORS 头，因此 Celmux 使用局域网 IP 或公网域名
-   都可以访问。接口仍然必须携带 `CELMUX_AGENT_TOKEN`，不要将 Worker 地址和
+Worker 会根据请求的来源自动返回 CORS 头，因此 Celmux 使用局域网 IP 或公网域名
+都可以访问，不需要额外配置回源地址。接口仍然必须携带 `CELMUX_AGENT_TOKEN`，不要将 Worker 地址和
    Token 误认为可以单独作为认证。
 
 ## Celmux 中的配置
@@ -95,8 +94,7 @@ Celmux 与 Worker 之间固定传输 16 kHz、单声道、PCM16、20 ms 音频�
 - **为什么部署后拨号失败？** 先确认 Agent 地址是 HTTPS、Celmux 与 Worker 的
   `CELMUX_AGENT_TOKEN` 完全一致，并确认 RealtimeKit 的 App ID/Token 已填写。
 - **浏览器跨域错误？** 确认浏览器访问 Celmux 的地址可以访问 Worker，并检查
-  Worker 请求中携带了正确的 Bearer Token。Worker 不需要配置回源域名或
-  `CELMUX_ALLOWED_ORIGIN`。
+  Worker 请求中携带了正确的 Bearer Token。Worker 不需要配置回源域名。
 - **如何更新？** 在仓库执行 `git pull && npm install && npm run deploy`，Durable
   Object 会保留已有通话记录。
 
