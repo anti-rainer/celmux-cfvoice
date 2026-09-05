@@ -13,7 +13,7 @@ npx wrangler whoami >/dev/null 2>&1 || {
 }
 
 echo "依次输入 Secret。输入不会显示，也不会写入仓库。"
-for name in CELMUX_AGENT_TOKEN CLOUDFLARE_REALTIME_APP_ID CLOUDFLARE_REALTIME_API_TOKEN; do
+for name in CELMUX_AGENT_TOKEN CLOUDFLARE_SFU_APP_ID CLOUDFLARE_SFU_API_TOKEN; do
   npx wrangler secret put "$name"
 done
 

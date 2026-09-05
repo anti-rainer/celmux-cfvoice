@@ -725,8 +725,8 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
 }
 
 function sfuConfig(env: Env): SFUConfig | null {
-  const appId = env.CLOUDFLARE_REALTIME_APP_ID?.trim();
-  const apiToken = env.CLOUDFLARE_REALTIME_API_TOKEN?.trim();
+  const appId = (env.CLOUDFLARE_SFU_APP_ID || env.CLOUDFLARE_REALTIME_APP_ID)?.trim();
+  const apiToken = (env.CLOUDFLARE_SFU_API_TOKEN || env.CLOUDFLARE_REALTIME_API_TOKEN)?.trim();
   return appId && apiToken ? { appId, apiToken } : null;
 }
 

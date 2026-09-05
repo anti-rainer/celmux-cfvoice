@@ -13,9 +13,8 @@ Durable Object、Realtime SFU 媒体桥和 Workers AI。
    当前显示为准。
 3. 在 Cloudflare 控制台进入 **Realtime → SFU / Serverless SFU**，启用
    Serverless SFU 并创建一个 SFU 应用。
-4. 保存该 SFU 应用的 **App ID**，并创建具有 **Realtime / Realtime Admin**
-   权限的账号 API Token。两者只在部署时写入 Worker Secret，不能填入
-   Celmux 前端或提交到 Git。
+4. 保存该 SFU 应用的 **App ID** 与 **API 令牌**，这两个值将用于 Worker 的环境变量。
+   API 令牌应授予 **Realtime / Realtime Admin** 权限；不要填入 Celmux 前端或提交到 Git。
 
 > 本项目使用的是 Cloudflare **Serverless SFU（官方文档称 Realtime SFU）**，
 > 不是 RealtimeKit。RealtimeKit 是带会议、参与者、Preset 和 UI Kit 的上层
@@ -34,8 +33,8 @@ Secrets**，添加以下变量（建议全部使用加密 Secret）：
 | 变量 | 填写内容 |
 | --- | --- |
 | `CELMUX_AGENT_TOKEN` | 自己生成的随机字符串，稍后填写到 Celmux |
-| `CLOUDFLARE_REALTIME_APP_ID` | Cloudflare Serverless SFU 应用 ID |
-| `CLOUDFLARE_REALTIME_API_TOKEN` | 具备 Realtime / Realtime Admin 权限的 API Token |
+| `CLOUDFLARE_SFU_APP_ID` | Serverless SFU 应用的 App ID，用于 Worker 连接 SFU |
+| `CLOUDFLARE_SFU_API_TOKEN` | SFU 应用的 API 令牌，用于 Worker 调用 SFU API |
 
 Workers AI 使用绑定，不需要额外填写模型 API Key。
 
@@ -44,8 +43,8 @@ Workers AI 使用绑定，不需要额外填写模型 API Key。
 部署 Worker 后：
 
 1. 打开 Worker 的 **Settings → Variables and Secrets**。
-2. 新增 `CELMUX_AGENT_TOKEN`、`CLOUDFLARE_REALTIME_APP_ID`、
-   `CLOUDFLARE_REALTIME_API_TOKEN` 三个加密 Secret。
+2. 新增 `CELMUX_AGENT_TOKEN`、`CLOUDFLARE_SFU_APP_ID`、
+   `CLOUDFLARE_SFU_API_TOKEN` 三个加密 Secret。
 3. 打开 Worker 的 **Settings → Domains & Routes → Custom Domains**，绑定你
    自己的域名（例如 `voice.example.com`）。请不要把 `workers.dev` 地址作为
    对外服务地址，部分网络环境会污染或拦截该域名。
@@ -74,8 +73,8 @@ Worker 地址和 Token 误认为可以单独作为认证。
 npm install
 npx wrangler login
 npx wrangler secret put CELMUX_AGENT_TOKEN
-npx wrangler secret put CLOUDFLARE_REALTIME_APP_ID
-npx wrangler secret put CLOUDFLARE_REALTIME_API_TOKEN
+npx wrangler secret put CLOUDFLARE_SFU_APP_ID
+npx wrangler secret put CLOUDFLARE_SFU_API_TOKEN
 npm run deploy
 ```
 
