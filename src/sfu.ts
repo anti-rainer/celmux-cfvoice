@@ -198,37 +198,25 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
     if (!downlinkTrack?.sessionId || !downlinkTrack.trackName) throw new Error("downlink_adapter_failed");
 
     const browser = await createSFUSession(sfu);
+    // Realtime SFU currently rejects a request that pushes and pulls tracks at
+    // the same time (HTTP 406). Establish the browser uplink first, then the
+    // client calls /subscribe for a separate downlink renegotiation.
     const published = await addSFUTracks(sfu, browser.sessionId, {
       sessionDescription: { type: "offer", sdp },
-      // The downlink adapter is already created above. Add it in the initial
-      // tracks request so the first SDP answer contains both directions. This
-      // avoids waiting for a second subscribe/renegotiate round before the
-      // caller can hear carrier audio.
-      tracks: [
-        { location: "local", mid, trackName: "browser-uplink" },
-        {
-          location: "remote",
-          sessionId: downlinkTrack.sessionId,
-          trackName: downlinkTrack.trackName,
-        },
-      ],
+      tracks: [{ location: "local", mid, trackName: "browser-uplink" }],
     }) as TrackResponse;
     const answer = published.sessionDescription;
     if (answer?.type !== "answer" || !answer.sdp) throw new Error("sfu_answer_missing");
 
     const browserTrack = published.tracks?.find(track => track.trackName === "browser-uplink");
-    const browserDownlink = published.tracks?.find(
-      track => track.trackName === downlinkTrack.trackName,
-    );
-    const downlinkReady = !published.requiresImmediateRenegotiation
-      && Boolean(browserDownlink?.mid);
+    const downlinkReady = false;
     await callAgent.fetch("https://agent.internal/resources", {
       method: "POST",
       headers: internalHeaders(env),
       body: JSON.stringify({
         browserSessionId: browser.sessionId,
         browserTrackMid: browserTrack?.mid || mid,
-        browserDownlinkMid: downlinkReady ? browserDownlink?.mid || "" : "",
+        browserDownlinkMid: "",
         downlinkSessionId: downlinkTrack.sessionId,
         downlinkTrackName: downlinkTrack.trackName,
         downlinkTrackMid: downlinkTrack.mid || "",
