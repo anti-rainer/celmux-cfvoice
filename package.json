@@ -1,0 +1,22 @@
+{
+  "name": "celmux-cloudflare-voice-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "setup": "bash ./scripts/setup.sh",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@cloudflare/voice": "^0.4.0",
+    "agents": "^0.22.0",
+    "ai": "^7.0.92"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260903.1",
+    "typescript": "^5.8.2",
+    "wrangler": "^4.30.0"
+  }
+}

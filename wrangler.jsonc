@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "celmux-cfvoice",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-02",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "routes": [],
+  "ai": {
+    "binding": "AI",
+    "remote": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CelmuxCallAgent",
+        "class_name": "CelmuxCallAgent"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CelmuxVoiceAgent"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["CelmuxCallRoom"]
+    },
+    {
+      "tag": "v3",
+      "deleted_classes": ["CelmuxVoiceAgent", "CelmuxCallRoom"],
+      "new_sqlite_classes": ["CelmuxCallAgent"]
+    }
+  ]
+}
