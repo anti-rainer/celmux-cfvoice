@@ -251,6 +251,11 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
       }).catch(() => undefined);
     }
     const message = error instanceof Error ? error.message : "sfu_request_failed";
+    console.error("Celmux Cloudflare SFU request failed", {
+      callId,
+      message,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     return Response.json({ error: "sfu_request_failed", message }, { status: 502, headers });
   }
 }
