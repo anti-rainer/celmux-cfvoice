@@ -75,6 +75,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private sttRetryAt: Record<CaptionDirection, number> = { incoming: 0, outgoing: 0 };
   private pendingInterim: Record<CaptionDirection, string> = { incoming: "", outgoing: "" };
   private audioFrames: Record<CaptionDirection, number> = { incoming: 0, outgoing: 0 };
+  private recentSpeechAt: Record<CaptionDirection, number> = { incoming: 0, outgoing: 0 };
   private chunkBuffers: Record<CaptionDirection, Uint8Array> = {
     incoming: new Uint8Array(0),
     outgoing: new Uint8Array(0),
@@ -108,6 +109,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       this.sttRetryAt = { incoming: 0, outgoing: 0 };
       this.pendingInterim = { incoming: "", outgoing: "" };
       this.audioFrames = { incoming: 0, outgoing: 0 };
+      this.recentSpeechAt = { incoming: 0, outgoing: 0 };
       this.chunkBuffers = { incoming: new Uint8Array(0), outgoing: new Uint8Array(0) };
       this.chunkTails = { incoming: Promise.resolve(), outgoing: Promise.resolve() };
       this.lastChunkText = { incoming: "", outgoing: "" };
@@ -304,6 +306,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private feed(direction: CaptionDirection, audio: ArrayBuffer): void {
     if (!this.state.transcription) return;
     this.audioFrames[direction] += audio.byteLength / PCM16_20MS_BYTES;
+    if (hasLikelySpeechFrame(new Uint8Array(audio))) this.recentSpeechAt[direction] = Date.now();
     if (this.state.transcriptionMode === "chunked") {
       this.feedChunked(direction, audio);
       return;
@@ -333,9 +336,17 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
 
   private async transcribeChunk(direction: CaptionDirection, pcm: Uint8Array): Promise<void> {
     if (!this.state.transcription) return;
+    if (!containsLikelySpeech(pcm)) {
+      this.lastChunkText[direction] = "";
+      return;
+    }
     const result = await this.env.AI.run("@cf/openai/whisper-large-v3-turbo", {
       audio: pcmToWavBase64(pcm),
       task: "transcribe",
+      vad_filter: true,
+      condition_on_previous_text: false,
+      no_speech_threshold: 0.45,
+      hallucination_silence_threshold: 0.5,
       ...(explicitLanguage(direction === "incoming" ? this.state.sourceLanguage : this.state.targetLanguage)
         ? { language: direction === "incoming" ? this.state.sourceLanguage : this.state.targetLanguage }
         : {}),
@@ -365,6 +376,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     session = provider.createSession({
       language: direction === "incoming" ? this.state.sourceLanguage : this.state.targetLanguage,
       onInterim: text => {
+        if (!this.hasRecentSpeech(direction)) return;
         this.pendingInterim[direction] = text.trim();
         this.broadcastControl({
           type: "caption",
@@ -376,6 +388,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       },
       onUtterance: text => {
         this.pendingInterim[direction] = "";
+        if (!this.hasRecentSpeech(direction)) return;
         this.scheduleCaption(direction, text);
       },
       onFatalError: error => {
@@ -392,6 +405,10 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     if (direction === "incoming") this.incomingSTT = session;
     else this.outgoingSTT = session;
     return session;
+  }
+
+  private hasRecentSpeech(direction: CaptionDirection): boolean {
+    return Date.now() - this.recentSpeechAt[direction] <= 4_000;
   }
 
   private scheduleCaption(direction: CaptionDirection, text: string): void {
@@ -678,7 +695,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     for (const direction of ["incoming", "outgoing"] as const) {
       const trailing = this.pendingInterim[direction];
       this.pendingInterim[direction] = "";
-      if (trailing) this.scheduleCaption(direction, trailing);
+      if (trailing && this.hasRecentSpeech(direction)) this.scheduleCaption(direction, trailing);
     }
     this.incomingSTT?.close();
     this.outgoingSTT?.close();
@@ -771,6 +788,58 @@ function appendBytes(
   combined.set(left);
   combined.set(right, left.byteLength);
   return combined;
+}
+
+type PcmLevel = { rms: number; span: number };
+
+function pcmLevel(pcm: Uint8Array, offset: number, length: number): PcmLevel {
+  const samples = Math.floor(length / 2);
+  if (!samples) return { rms: 0, span: 0 };
+  const view = new DataView(pcm.buffer, pcm.byteOffset + offset, samples * 2);
+  let sum = 0;
+  let minimum = 32_767;
+  let maximum = -32_768;
+  for (let index = 0; index < samples; index += 1) {
+    const sample = view.getInt16(index * 2, true);
+    sum += sample;
+    minimum = Math.min(minimum, sample);
+    maximum = Math.max(maximum, sample);
+  }
+  const mean = sum / samples;
+  let squares = 0;
+  for (let index = 0; index < samples; index += 1) {
+    const centered = view.getInt16(index * 2, true) - mean;
+    squares += centered * centered;
+  }
+  return { rms: Math.sqrt(squares / samples), span: maximum - minimum };
+}
+
+function hasLikelySpeechFrame(pcm: Uint8Array): boolean {
+  for (let offset = 0; offset + PCM16_20MS_BYTES <= pcm.byteLength; offset += PCM16_20MS_BYTES) {
+    const level = pcmLevel(pcm, offset, PCM16_20MS_BYTES);
+    if (level.rms >= 160 && level.span >= 800) return true;
+  }
+  return false;
+}
+
+function containsLikelySpeech(pcm: Uint8Array): boolean {
+  const levels: PcmLevel[] = [];
+  for (let offset = 0; offset + PCM16_20MS_BYTES <= pcm.byteLength; offset += PCM16_20MS_BYTES) {
+    levels.push(pcmLevel(pcm, offset, PCM16_20MS_BYTES));
+  }
+  if (levels.length < 4) return false;
+  const sortedRms = levels.map(level => level.rms).sort((left, right) => left - right);
+  const noiseFloor = sortedRms[Math.floor(sortedRms.length * 0.2)] || 0;
+  const threshold = Math.max(140, Math.min(600, noiseFloor * 2 + 60));
+  let voicedFrames = 0;
+  let maximumRms = 0;
+  let maximumSpan = 0;
+  for (const level of levels) {
+    maximumRms = Math.max(maximumRms, level.rms);
+    maximumSpan = Math.max(maximumSpan, level.span);
+    if (level.rms >= threshold && level.span >= 800) voicedFrames += 1;
+  }
+  return voicedFrames >= 4 && maximumRms >= 220 && maximumSpan >= 1_000;
 }
 
 /** Convert one or more 16 kHz mono PCM frames to 48 kHz stereo PCM without
