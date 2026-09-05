@@ -8,12 +8,19 @@ Durable Object、Realtime SFU 媒体桥和 Workers AI。
 请先完成以下准备工作，再点击一键部署：
 
 1. 注册并登录 Cloudflare 账号。
-2. 在 Cloudflare 账号中完成付款方式/银行卡验证。RealtimeKit 和部分
+2. 在 Cloudflare 账号中完成付款方式/银行卡验证。Realtime 产品和部分
    Workers AI 能力需要账号具备有效的计费资格；具体免费额度和价格以控制台
    当前显示为准。
-3. 在 Cloudflare 控制台启用 **RealtimeKit**，创建一个应用。
-4. 保存该应用的 **App ID** 和 **App Token**。它们只在部署时写入 Worker
-   Secret，不能填入 Celmux 前端或提交到 Git。
+3. 在 Cloudflare 控制台进入 **Realtime → SFU / Serverless SFU**，启用
+   Serverless SFU 并创建一个 SFU 应用。
+4. 保存该 SFU 应用的 **App ID**，并创建具有 **Realtime / Realtime Admin**
+   权限的账号 API Token。两者只在部署时写入 Worker Secret，不能填入
+   Celmux 前端或提交到 Git。
+
+> 本项目使用的是 Cloudflare **Serverless SFU（官方文档称 Realtime SFU）**，
+> 不是 RealtimeKit。RealtimeKit 是带会议、参与者、Preset 和 UI Kit 的上层
+> 产品；Celmux 需要的是 SFU 的会话、轨道、媒体转发和 WebSocket 适配器 API，
+> 因此不需要创建 RealtimeKit 应用，也不需要 participant token、会议或 UI Kit。
 
 ## 一键部署
 
@@ -27,8 +34,8 @@ Secrets**，添加以下变量（建议全部使用加密 Secret）：
 | 变量 | 填写内容 |
 | --- | --- |
 | `CELMUX_AGENT_TOKEN` | 自己生成的随机字符串，稍后填写到 Celmux |
-| `CLOUDFLARE_REALTIME_APP_ID` | Cloudflare RealtimeKit 应用 ID |
-| `CLOUDFLARE_REALTIME_API_TOKEN` | RealtimeKit API Token |
+| `CLOUDFLARE_REALTIME_APP_ID` | Cloudflare Serverless SFU 应用 ID |
+| `CLOUDFLARE_REALTIME_API_TOKEN` | 具备 Realtime / Realtime Admin 权限的 API Token |
 
 Workers AI 使用绑定，不需要额外填写模型 API Key。
 
@@ -58,7 +65,7 @@ Worker 地址和 Token 误认为可以单独作为认证。
 4. 根据需要打开转文字、文字翻译和上行语音翻译。
 5. 转写模式可选择：
    - **Realtime 流式**：延迟最低，使用 Cloudflare Realtime STT。
-   - **Whisper large-v3-turbo 分片**：每秒提交短音频片段，节省 Realtime 转写额度。
+   - **Whisper large-v3-turbo 分片**：每 2 秒提交音频片段，节省 Realtime 转写额度。
 6. 点击「保存语音配置」，下一通电话生效。
 
 ## 命令行部署
@@ -92,7 +99,7 @@ Celmux 与 Worker 之间固定传输 16 kHz、单声道、PCM16、20 ms 音频�
 ## 常见问题
 
 - **为什么部署后拨号失败？** 先确认 Agent 地址是 HTTPS、Celmux 与 Worker 的
-  `CELMUX_AGENT_TOKEN` 完全一致，并确认 RealtimeKit 的 App ID/Token 已填写。
+  `CELMUX_AGENT_TOKEN` 完全一致，并确认 Serverless SFU 的 App ID/API Token 已填写。
 - **浏览器跨域错误？** 确认浏览器访问 Celmux 的地址可以访问 Worker，并检查
   Worker 请求中携带了正确的 Bearer Token。Worker 不需要配置回源域名。
 - **如何更新？** 在仓库执行 `git pull && npm install && npm run deploy`，Durable
@@ -101,4 +108,4 @@ Celmux 与 Worker 之间固定传输 16 kHz、单声道、PCM16、20 ms 音频�
 ## 安全提示
 
 不要把任何 Token 写入 `wrangler.jsonc`、README 或提交到 Git。推荐使用
-`wrangler secret put`，并定期轮换 `CELMUX_AGENT_TOKEN` 与 RealtimeKit Token。
+`wrangler secret put`，并定期轮换 `CELMUX_AGENT_TOKEN` 与 Serverless SFU API Token。
