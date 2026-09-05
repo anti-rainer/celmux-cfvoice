@@ -1,8 +1,9 @@
 export function corsHeaders(request: Request, env: Env): HeadersInit {
   const origin = request.headers.get("Origin") || "";
-  const allowed = env.CELMUX_ALLOWED_ORIGIN?.trim() || origin;
   return {
-    "Access-Control-Allow-Origin": allowed,
+    // Bearer authorization protects the API; reflect the caller origin so
+    // LAN IPs and public hostnames work without extra configuration.
+    "Access-Control-Allow-Origin": origin || "*",
     "Access-Control-Allow-Headers": "Authorization, Content-Type",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     Vary: "Origin",
