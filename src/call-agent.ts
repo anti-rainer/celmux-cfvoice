@@ -7,7 +7,6 @@ import {
   downsample48kStereoTo16kMono,
   createSFUWebSocketAdapter,
   renegotiateSFUSession,
-  upsample16kMonoTo48kStereo,
   type TranscriberSession,
 } from "@cloudflare/voice";
 import {
@@ -85,7 +84,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     outgoing: Promise.resolve(),
   };
   private lastChunkText: Record<CaptionDirection, string> = { incoming: "", outgoing: "" };
-  private downlinkLastSample: number | null = null;
+  private downlinkResampleSample: number | null = null;
 
   shouldSendProtocolMessages(): boolean {
     return false;
@@ -112,7 +111,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       this.chunkBuffers = { incoming: new Uint8Array(0), outgoing: new Uint8Array(0) };
       this.chunkTails = { incoming: Promise.resolve(), outgoing: Promise.resolve() };
       this.lastChunkText = { incoming: "", outgoing: "" };
-      this.downlinkLastSample = null;
+      this.downlinkResampleSample = null;
       this.setState({
         ...EMPTY_STATE,
         ...features,
@@ -277,30 +276,15 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     if (!audio.byteLength || audio.byteLength % PCM16_20MS_BYTES !== 0) return;
     // Original conversation audio is the real-time path. Never put an AI
     // provider send ahead of it: a congested STT socket must not delay audio.
-    const pcm48 = upsample16kMonoTo48kStereo(this.smoothDownlinkPcm(audio));
+    // Celmux has already decoded and (when necessary) repaired the carrier
+    // RTP stream. Keep the PCM continuous here and use a stateful linear 3x
+    // interpolation so the SFU Opus encoder never sees sample-hold edges.
+    const resampled = upsample16kMonoTo48kStereoLinear(audio, this.downlinkResampleSample);
+    this.downlinkResampleSample = resampled.lastSample;
+    const pcm48 = resampled.audio;
     this.sendBinary("sfu-downlink", encodePayloadToProtobuf(pcm48));
     this.sendPcmFrames("access", audio);
     this.feed("incoming", audio);
-  }
-
-  private smoothDownlinkPcm(audio: ArrayBuffer): ArrayBuffer {
-    const bytes = new Uint8Array(audio.slice(0));
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    for (let offset = 0; offset + PCM16_20MS_BYTES <= bytes.byteLength; offset += PCM16_20MS_BYTES) {
-      const first = view.getInt16(offset, true);
-      const previous = this.downlinkLastSample;
-      if (previous !== null && Math.abs(first - previous) >= 1_000) {
-        const samples = Math.min(24, PCM16_20MS_BYTES / 2);
-        const denominator = samples + 1;
-        for (let index = 0; index < samples; index += 1) {
-          const current = view.getInt16(offset + index * 2, true);
-          const blended = Math.round(previous + (current - previous) * (index + 1) / denominator);
-          view.setInt16(offset + index * 2, Math.max(-32768, Math.min(32767, blended)), true);
-        }
-      }
-      this.downlinkLastSample = view.getInt16(offset + PCM16_20MS_BYTES - 2, true);
-    }
-    return bytes.buffer;
   }
 
   private handleBrowserAudio(packet: ArrayBuffer): void {
@@ -787,6 +771,35 @@ function appendBytes(
   combined.set(left);
   combined.set(right, left.byteLength);
   return combined;
+}
+
+/** Convert one or more 16 kHz mono PCM frames to 48 kHz stereo PCM without
+ * resetting interpolation at each 20 ms WebSocket message. */
+function upsample16kMonoTo48kStereoLinear(
+  mono16k: ArrayBuffer,
+  previousSample: number | null,
+): { audio: Uint8Array; lastSample: number | null } {
+  const input = new DataView(mono16k);
+  const sampleCount = Math.floor(mono16k.byteLength / 2);
+  const output = new Uint8Array(sampleCount * 3 * 4);
+  const view = new DataView(output.buffer);
+  let previous = previousSample;
+  for (let index = 0; index < sampleCount; index += 1) {
+    const current = input.getInt16(index * 2, true);
+    const from = previous ?? current;
+    const values = [
+      Math.round((from * 2 + current) / 3),
+      Math.round((from + current * 2) / 3),
+      current,
+    ];
+    for (let phase = 0; phase < 3; phase += 1) {
+      const offset = (index * 3 + phase) * 4;
+      view.setInt16(offset, values[phase], true);
+      view.setInt16(offset + 2, values[phase], true);
+    }
+    previous = current;
+  }
+  return { audio: output, lastSample: previous };
 }
 
 function pcmToWavBase64(pcm: Uint8Array): string {
