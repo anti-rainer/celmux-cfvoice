@@ -40,7 +40,7 @@ const EMPTY_STATE: PersistedCallState = {
   translation: false,
   speechTranslation: false,
   sourceLanguage: "auto",
-  targetLanguage: "zh-CN",
+  targetLanguage: "zh",
   browserSessionId: "",
   browserTrackMid: "",
   browserDownlinkMid: "",
@@ -85,6 +85,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     outgoing: Promise.resolve(),
   };
   private lastChunkText: Record<CaptionDirection, string> = { incoming: "", outgoing: "" };
+  private downlinkLastSample: number | null = null;
 
   shouldSendProtocolMessages(): boolean {
     return false;
@@ -102,7 +103,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       const transcription = features.transcription === true;
       const transcriptionMode = features.transcriptionMode === "chunked" ? "chunked" : "realtime";
       const sourceLanguage = normalizeLanguage(features.sourceLanguage, "auto");
-      const targetLanguage = normalizeLanguage(features.targetLanguage, "zh-CN");
+      const targetLanguage = normalizeLanguage(features.targetLanguage, "zh");
       this.closing = false;
       this.closeTask = null;
       this.sttRetryAt = { incoming: 0, outgoing: 0 };
@@ -111,6 +112,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       this.chunkBuffers = { incoming: new Uint8Array(0), outgoing: new Uint8Array(0) };
       this.chunkTails = { incoming: Promise.resolve(), outgoing: Promise.resolve() };
       this.lastChunkText = { incoming: "", outgoing: "" };
+      this.downlinkLastSample = null;
       this.setState({
         ...EMPTY_STATE,
         ...features,
@@ -275,10 +277,30 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     if (!audio.byteLength || audio.byteLength % PCM16_20MS_BYTES !== 0) return;
     // Original conversation audio is the real-time path. Never put an AI
     // provider send ahead of it: a congested STT socket must not delay audio.
-    const pcm48 = upsample16kMonoTo48kStereo(audio);
+    const pcm48 = upsample16kMonoTo48kStereo(this.smoothDownlinkPcm(audio));
     this.sendBinary("sfu-downlink", encodePayloadToProtobuf(pcm48));
     this.sendPcmFrames("access", audio);
     this.feed("incoming", audio);
+  }
+
+  private smoothDownlinkPcm(audio: ArrayBuffer): ArrayBuffer {
+    const bytes = new Uint8Array(audio.slice(0));
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    for (let offset = 0; offset + PCM16_20MS_BYTES <= bytes.byteLength; offset += PCM16_20MS_BYTES) {
+      const first = view.getInt16(offset, true);
+      const previous = this.downlinkLastSample;
+      if (previous !== null && Math.abs(first - previous) >= 1_000) {
+        const samples = Math.min(24, PCM16_20MS_BYTES / 2);
+        const denominator = samples + 1;
+        for (let index = 0; index < samples; index += 1) {
+          const current = view.getInt16(offset + index * 2, true);
+          const blended = Math.round(previous + (current - previous) * (index + 1) / denominator);
+          view.setInt16(offset + index * 2, Math.max(-32768, Math.min(32767, blended)), true);
+        }
+      }
+      this.downlinkLastSample = view.getInt16(offset + PCM16_20MS_BYTES - 2, true);
+    }
+    return bytes.buffer;
   }
 
   private handleBrowserAudio(packet: ArrayBuffer): void {
@@ -313,7 +335,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
    * path remains synchronous; inference is chained per direction so a slow
    * request can never reorder captions or stall telephone audio. */
   private feedChunked(direction: CaptionDirection, audio: ArrayBuffer): void {
-    const chunkBytes = 16_000 * 2; // 1 second, mono PCM16 at 16 kHz
+    const chunkBytes = 16_000 * 2 * 2; // 2 seconds, mono PCM16 at 16 kHz
     this.chunkBuffers[direction] = appendBytes(this.chunkBuffers[direction], new Uint8Array(audio) as Uint8Array<ArrayBuffer>);
     while (this.chunkBuffers[direction].byteLength >= chunkBytes) {
       const chunk = this.chunkBuffers[direction].slice(0, chunkBytes);
@@ -735,7 +757,11 @@ function validAccessKind(value: unknown): value is PersistedCallState["accessKin
 }
 
 function normalizeLanguage(value: unknown, fallback: string): string {
-  return typeof value === "string" && value.trim() ? value.trim() : fallback;
+  if (typeof value !== "string" || !value.trim()) return fallback;
+  const normalized = value.trim().replaceAll("_", "-").toLowerCase();
+  if (normalized === "auto") return "auto";
+  if (normalized.startsWith("zh")) return "zh";
+  return normalized.split("-", 1)[0] || fallback;
 }
 
 function explicitLanguage(value: string): boolean {
