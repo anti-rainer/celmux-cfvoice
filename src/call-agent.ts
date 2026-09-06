@@ -92,6 +92,12 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private chunkSpeechActive: Record<CaptionDirection, boolean> = { incoming: false, outgoing: false };
   private chunkPreRoll: Record<CaptionDirection, Uint8Array[]> = { incoming: [], outgoing: [] };
   private lastChunkText: Record<CaptionDirection, string> = { incoming: "", outgoing: "" };
+  private pendingCaptions: Array<{
+    direction: CaptionDirection;
+    text: string;
+    translatedText: string;
+    occurredAt: string;
+  }> = [];
   private downlinkResampleSample: number | null = null;
 
   shouldSendProtocolMessages(): boolean {
@@ -122,6 +128,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       this.chunkTails = { incoming: Promise.resolve(), outgoing: Promise.resolve() };
       this.resetChunkVad();
       this.lastChunkText = { incoming: "", outgoing: "" };
+      this.pendingCaptions = [];
       this.downlinkResampleSample = null;
       this.setState({
         ...EMPTY_STATE,
@@ -550,10 +557,12 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         occurred_at TEXT NOT NULL
       )
     `;
-    this.sql`
-      INSERT INTO call_captions (direction, text, translated_text, occurred_at)
-      VALUES (${direction}, ${clean}, ${translatedText}, ${event.occurred_at})
-    `;
+    this.pendingCaptions.push({
+      direction,
+      text: clean,
+      translatedText,
+      occurredAt: event.occurred_at,
+    });
     this.broadcastControl(event);
     if (synthesizeOutgoing && translatedText) {
       try {
@@ -730,6 +739,13 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         occurred_at TEXT NOT NULL
       )
     `;
+    for (const caption of this.pendingCaptions) {
+      this.sql`
+        INSERT INTO call_captions (direction, text, translated_text, occurred_at)
+        VALUES (${caption.direction}, ${caption.text}, ${caption.translatedText}, ${caption.occurredAt})
+      `;
+    }
+    this.pendingCaptions = [];
     const captions = this.sql<{
       id: number;
       direction: CaptionDirection;
@@ -802,6 +818,13 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         occurred_at TEXT NOT NULL
       )
     `;
+    for (const caption of this.pendingCaptions) {
+      this.sql`
+        INSERT INTO call_captions (direction, text, translated_text, occurred_at)
+        VALUES (${caption.direction}, ${caption.text}, ${caption.translatedText}, ${caption.occurredAt})
+      `;
+    }
+    this.pendingCaptions = [];
     console.info("Celmux call transcription closed", {
       incomingFrames: this.audioFrames.incoming,
       outgoingFrames: this.audioFrames.outgoing,
