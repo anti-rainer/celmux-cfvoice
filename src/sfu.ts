@@ -41,6 +41,8 @@ type VoiceTestBody = {
   text?: string;
   target_language?: string;
   voice?: string;
+  language?: string;
+  translate?: boolean;
 };
 
 function config(env: Env): SFUConfig | null {
@@ -303,12 +305,14 @@ export async function handleVoiceTestApi(request: Request, env: Env): Promise<Re
     }
     if (kind === "speech") {
       const text = typeof body.text === "string" ? body.text.trim() : "";
+      const language = typeof body.language === "string" ? body.language.trim() : "en";
+      const speechText = body.translate === true ? await translate(env.AI, text, language) : text;
       const voice = typeof body.voice === "string" && /^[a-z][a-z0-9_-]{1,31}$/i.test(body.voice.trim())
         ? body.voice.trim().toLowerCase()
         : "asteria";
       if (!text || text.length > 4_096) return jsonError("invalid_text", 400, headers);
       const response = await (env.AI.run as unknown as (model: string, input: unknown, options: unknown) => Promise<Response>)("@cf/deepgram/aura-1", {
-        text,
+        text: speechText || text,
         speaker: voice,
         encoding: "linear16",
         container: "none",
@@ -316,7 +320,7 @@ export async function handleVoiceTestApi(request: Request, env: Env): Promise<Re
       }, { returnRawResponse: true });
       if (!response.ok || !response.body) return jsonError(`speech_failed_${response.status}`, 502, headers);
       const bytes = new Uint8Array(await response.arrayBuffer());
-      return Response.json({ status: "ok", voice, sample_rate: 16_000, audio_base64: bytesToBase64(bytes) }, { headers });
+      return Response.json({ status: "ok", voice, language, sample_rate: 16_000, audio_base64: bytesToBase64(bytes) }, { headers });
     }
     return jsonError("invalid_test_kind", 400, headers);
   } catch (error) {
