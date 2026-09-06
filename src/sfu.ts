@@ -6,6 +6,7 @@ import {
 import { authorized, corsHeaders, jsonError } from "./auth";
 import type { CallAccessKind, CallFeatureConfig, RoleTickets } from "./protocol";
 import { cleanupSFUResources, type SFUConfig } from "./sfu-api";
+import { translate } from "./call-agent";
 
 type AdapterTrack = {
   sessionId?: string;
@@ -33,6 +34,14 @@ type RenegotiateBody = {
 };
 
 type SubscribeBody = { uplink_url?: string };
+
+type VoiceTestBody = {
+  kind?: "transcription" | "translation" | "speech";
+  audio_base64?: string;
+  text?: string;
+  target_language?: string;
+  voice?: string;
+};
 
 function config(env: Env): SFUConfig | null {
   const appId = (env.CLOUDFLARE_SFU_APP_ID || env.CLOUDFLARE_REALTIME_APP_ID)?.trim();
@@ -259,6 +268,68 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
     const message = error instanceof Error ? error.message : "sfu_request_failed";
     return Response.json({ error: "sfu_request_failed", message }, { status: 502, headers });
   }
+}
+
+/** Lightweight effect tests used by the Cloudflare Voice settings panel. The
+ * endpoint uses the exact Workers AI models and speaker path used by calls,
+ * but never creates an SFU session or writes call captions. */
+export async function handleVoiceTestApi(request: Request, env: Env): Promise<Response | null> {
+  const url = new URL(request.url);
+  if (url.pathname !== "/api/test") return null;
+  const headers = corsHeaders(request, env);
+  if (request.method === "OPTIONS") return new Response(null, { status: 204, headers });
+  if (request.method !== "POST") return jsonError("method_not_allowed", 405, headers);
+  if (!authorized(request, env.CELMUX_AGENT_TOKEN)) return jsonError("unauthorized", 401, headers);
+  try {
+    const body = await request.json<VoiceTestBody>();
+    const kind = body.kind;
+    if (kind === "translation") {
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      const target = typeof body.target_language === "string" ? body.target_language.trim() : "zh";
+      if (!text || text.length > 4_096) return jsonError("invalid_text", 400, headers);
+      return Response.json({ status: "ok", text, translated_text: await translate(env.AI, text, target) }, { headers });
+    }
+    if (kind === "transcription") {
+      const audio = typeof body.audio_base64 === "string" ? body.audio_base64.trim() : "";
+      if (!audio || audio.length > 8_000_000) return jsonError("invalid_audio", 400, headers);
+      const result = await env.AI.run("@cf/openai/whisper-large-v3-turbo", {
+        audio,
+        task: "transcribe",
+        vad_filter: true,
+        condition_on_previous_text: false,
+        no_speech_threshold: 0.45,
+      }) as { text?: unknown; language?: unknown };
+      return Response.json({ status: "ok", text: String(result?.text || "").trim(), language: String(result?.language || "auto") }, { headers });
+    }
+    if (kind === "speech") {
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      const voice = typeof body.voice === "string" && /^[a-z][a-z0-9_-]{1,31}$/i.test(body.voice.trim())
+        ? body.voice.trim().toLowerCase()
+        : "asteria";
+      if (!text || text.length > 4_096) return jsonError("invalid_text", 400, headers);
+      const response = await (env.AI.run as unknown as (model: string, input: unknown, options: unknown) => Promise<Response>)("@cf/deepgram/aura-1", {
+        text,
+        speaker: voice,
+        encoding: "linear16",
+        container: "none",
+        sample_rate: 16_000,
+      }, { returnRawResponse: true });
+      if (!response.ok || !response.body) return jsonError(`speech_failed_${response.status}`, 502, headers);
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      return Response.json({ status: "ok", voice, sample_rate: 16_000, audio_base64: bytesToBase64(bytes) }, { headers });
+    }
+    return jsonError("invalid_test_kind", 400, headers);
+  } catch (error) {
+    return jsonError(error instanceof Error ? error.message : "voice_test_failed", 502, headers);
+  }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let output = "";
+  for (let offset = 0; offset < bytes.byteLength; offset += 0x8000) {
+    output += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.byteLength)));
+  }
+  return btoa(output);
 }
 
 function normalizeLanguage(value: unknown, fallback: string): string {
