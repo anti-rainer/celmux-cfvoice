@@ -8,6 +8,8 @@ export type CallFeatureConfig = {
   transcriptionMode: "realtime" | "chunked";
   translation: boolean;
   speechTranslation: boolean;
+  /** Deepgram Aura-1 speaker; voices are model-specific. */
+  speechVoice: string;
   sourceLanguage: string;
   targetLanguage: string;
 };

@@ -38,6 +38,7 @@ const EMPTY_STATE: PersistedCallState = {
   transcriptionMode: "realtime",
   translation: false,
   speechTranslation: false,
+  speechVoice: "asteria",
   sourceLanguage: "auto",
   targetLanguage: "zh",
   browserSessionId: "",
@@ -85,6 +86,11 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     incoming: Promise.resolve(),
     outgoing: Promise.resolve(),
   };
+  private chunkSilenceFrames: Record<CaptionDirection, number> = { incoming: 0, outgoing: 0 };
+  private chunkVoicedFrames: Record<CaptionDirection, number> = { incoming: 0, outgoing: 0 };
+  private chunkNoiseFloor: Record<CaptionDirection, number> = { incoming: 120, outgoing: 120 };
+  private chunkSpeechActive: Record<CaptionDirection, boolean> = { incoming: false, outgoing: false };
+  private chunkPreRoll: Record<CaptionDirection, Uint8Array[]> = { incoming: [], outgoing: [] };
   private lastChunkText: Record<CaptionDirection, string> = { incoming: "", outgoing: "" };
   private downlinkResampleSample: number | null = null;
 
@@ -105,6 +111,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       const transcriptionMode = features.transcriptionMode === "chunked" ? "chunked" : "realtime";
       const sourceLanguage = normalizeLanguage(features.sourceLanguage, "auto");
       const targetLanguage = normalizeLanguage(features.targetLanguage, "zh-CN");
+      const speechVoice = normalizeSpeechVoice(features.speechVoice);
       this.closing = false;
       this.closeTask = null;
       this.sttRetryAt = { incoming: 0, outgoing: 0 };
@@ -113,6 +120,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       this.recentSpeechAt = { incoming: 0, outgoing: 0 };
       this.chunkBuffers = { incoming: new Uint8Array(0), outgoing: new Uint8Array(0) };
       this.chunkTails = { incoming: Promise.resolve(), outgoing: Promise.resolve() };
+      this.resetChunkVad();
       this.lastChunkText = { incoming: "", outgoing: "" };
       this.downlinkResampleSample = null;
       this.setState({
@@ -130,6 +138,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
           && explicitLanguage(targetLanguage),
         sourceLanguage,
         targetLanguage,
+        speechVoice,
       });
       if (transcription && transcriptionMode === "realtime") {
         // Start both streaming recognizers while the signalling/SFU path is
@@ -346,16 +355,59 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
    * path remains synchronous; inference is chained per direction so a slow
    * request can never reorder captions or stall telephone audio. */
   private feedChunked(direction: CaptionDirection, audio: ArrayBuffer): void {
-    const chunkBytes = 16_000 * 2 * 2; // 2 seconds, mono PCM16 at 16 kHz
-    this.chunkBuffers[direction] = appendBytes(this.chunkBuffers[direction], new Uint8Array(audio) as Uint8Array<ArrayBuffer>);
-    while (this.chunkBuffers[direction].byteLength >= chunkBytes) {
-      const chunk = this.chunkBuffers[direction].slice(0, chunkBytes);
-      this.chunkBuffers[direction] = this.chunkBuffers[direction].slice(chunkBytes);
-      this.chunkTails[direction] = this.chunkTails[direction]
-        .then(() => this.transcribeChunk(direction, chunk))
-        .catch(error => this.reportError(error, "Cloudflare Whisper 转写失败"));
-      this.ctx.waitUntil(this.chunkTails[direction]);
+    for (let offset = 0; offset + PCM16_20MS_BYTES <= audio.byteLength; offset += PCM16_20MS_BYTES) {
+      const frame = new Uint8Array(audio.slice(offset, offset + PCM16_20MS_BYTES));
+      const level = pcmLevel(frame, 0, frame.byteLength);
+      const threshold = Math.max(140, this.chunkNoiseFloor[direction] * 2.7);
+      const voiced = level.rms >= threshold && level.span >= 800;
+      if (!this.chunkSpeechActive[direction]) {
+        if (voiced) {
+          this.chunkPreRoll[direction].push(frame);
+          if (this.chunkPreRoll[direction].length > 6) this.chunkPreRoll[direction].shift();
+          this.chunkVoicedFrames[direction] += 1;
+          if (this.chunkVoicedFrames[direction] >= 4) {
+            this.chunkSpeechActive[direction] = true;
+            for (const buffered of this.chunkPreRoll[direction]) {
+              this.chunkBuffers[direction] = appendBytes(this.chunkBuffers[direction], buffered);
+            }
+            this.chunkPreRoll[direction] = [];
+          }
+        } else {
+          this.chunkVoicedFrames[direction] = 0;
+          this.chunkPreRoll[direction] = [];
+          this.chunkNoiseFloor[direction] = Math.min(1200, this.chunkNoiseFloor[direction] * 0.96 + level.rms * 0.04);
+        }
+        continue;
+      }
+      this.chunkBuffers[direction] = appendBytes(this.chunkBuffers[direction], frame);
+      if (voiced) this.chunkSilenceFrames[direction] = 0;
+      else this.chunkSilenceFrames[direction] += 1;
+      // A 280 ms energy drop is a natural breath/intonation boundary. Keep a
+      // short pre-roll on the next utterance so consonant attacks are intact.
+      if (this.chunkSilenceFrames[direction] >= 14 || this.chunkBuffers[direction].byteLength >= 16_000 * 2 * 7) {
+        this.queueChunk(direction, this.chunkBuffers[direction]);
+        this.chunkBuffers[direction] = new Uint8Array(0);
+        this.chunkSilenceFrames[direction] = 0;
+        this.chunkVoicedFrames[direction] = 0;
+        this.chunkSpeechActive[direction] = false;
+      }
     }
+  }
+
+  private queueChunk(direction: CaptionDirection, chunk: Uint8Array): void {
+    if (chunk.byteLength < PCM16_20MS_BYTES * 4) return;
+    this.chunkTails[direction] = this.chunkTails[direction]
+      .then(() => this.transcribeChunk(direction, chunk))
+      .catch(error => this.reportError(error, "Cloudflare Whisper 转写失败"));
+    this.ctx.waitUntil(this.chunkTails[direction]);
+  }
+
+  private resetChunkVad(): void {
+    this.chunkSilenceFrames = { incoming: 0, outgoing: 0 };
+    this.chunkVoicedFrames = { incoming: 0, outgoing: 0 };
+    this.chunkNoiseFloor = { incoming: 120, outgoing: 120 };
+    this.chunkSpeechActive = { incoming: false, outgoing: false };
+    this.chunkPreRoll = { incoming: [], outgoing: [] };
   }
 
   private async transcribeChunk(direction: CaptionDirection, pcm: Uint8Array): Promise<void> {
@@ -541,6 +593,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       this.incomingSTT = null;
       this.outgoingSTT = null;
       this.chunkBuffers = { incoming: new Uint8Array(0), outgoing: new Uint8Array(0) };
+      this.resetChunkVad();
       this.lastChunkText = { incoming: "", outgoing: "" };
     }
     if (speechTranslation !== this.state.speechTranslation) this.speechGeneration += 1;
@@ -550,6 +603,9 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       transcriptionMode,
       translation: transcription && value.translation === true,
       speechTranslation,
+      speechVoice: value.speechVoice === undefined
+        ? this.state.speechVoice
+        : normalizeSpeechVoice(value.speechVoice),
     });
     if (transcription && transcriptionMode === "realtime") {
       this.transcriber("incoming");
@@ -566,9 +622,9 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
 
   private async streamTranslatedSpeech(text: string, generation: number): Promise<void> {
     if (!this.speechStreamActive(generation)) return;
-    const response = await this.env.AI.run("@cf/deepgram/aura-1", {
+    const response = await (this.env.AI.run as unknown as (model: string, input: unknown, options: unknown) => Promise<Response>)("@cf/deepgram/aura-1", {
       text,
-      speaker: "asteria",
+      speaker: this.state.speechVoice || "asteria",
       encoding: "linear16",
       container: "none",
       sample_rate: 16_000,
@@ -717,12 +773,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       for (const direction of ["incoming", "outgoing"] as const) {
         const trailing = this.chunkBuffers[direction];
         this.chunkBuffers[direction] = new Uint8Array(0);
-        if (trailing.byteLength >= 640) {
-          this.chunkTails[direction] = this.chunkTails[direction]
-            .then(() => this.transcribeChunk(direction, trailing))
-            .catch(error => this.reportError(error, "Cloudflare Whisper 转写失败"));
-          this.ctx.waitUntil(this.chunkTails[direction]);
-        }
+        this.queueChunk(direction, trailing);
       }
       await Promise.allSettled([this.chunkTails.incoming, this.chunkTails.outgoing]);
     }
@@ -997,7 +1048,7 @@ function validRoleUrl(value: string, role: MediaRole): { ticket: string } | null
   }
 }
 
-async function translate(ai: Ai, text: string, target: string): Promise<string> {
+export async function translate(ai: Ai, text: string, target: string): Promise<string> {
   if (!target || target.toLowerCase() === "auto") return "";
   const result = await ai.run("@cf/meta/llama-3.2-3b-instruct", {
     messages: [
@@ -1009,4 +1060,10 @@ async function translate(ai: Ai, text: string, target: string): Promise<string> 
   });
   if (!result || typeof result !== "object" || !("response" in result)) return "";
   return String((result as { response?: unknown }).response || "").trim();
+}
+
+function normalizeSpeechVoice(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) return "asteria";
+  const voice = value.trim().toLowerCase();
+  return /^[a-z][a-z0-9_-]{1,31}$/.test(voice) ? voice : "asteria";
 }

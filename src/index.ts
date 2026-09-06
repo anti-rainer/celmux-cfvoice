@@ -1,6 +1,6 @@
 import { routeAgentRequest } from "agents";
 import { CelmuxCallAgent } from "./call-agent";
-import { handleCallApi } from "./sfu";
+import { handleCallApi, handleVoiceTestApi } from "./sfu";
 
 export { CelmuxCallAgent };
 
@@ -12,6 +12,8 @@ export default {
       const agent = env.CelmuxCallAgent.get(env.CelmuxCallAgent.idFromName(callMatch[1]));
       return agent.fetch(request);
     }
+    const voiceTest = await handleVoiceTestApi(request, env);
+    if (voiceTest) return voiceTest;
     const call = await handleCallApi(request, env);
     if (call) return call;
     const agent = await routeAgentRequest(request, env);
