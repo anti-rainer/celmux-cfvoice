@@ -27,6 +27,8 @@ export type PersistedCallState = CallFeatureConfig & {
   browserSessionId: string;
   browserTrackMid: string;
   browserDownlinkMid: string;
+  /** True once the SFU downlink is bound to the browser session. */
+  downlinkReady: boolean;
   pendingDownlinkOfferSdp: string;
   downlinkSessionId: string;
   downlinkTrackName: string;

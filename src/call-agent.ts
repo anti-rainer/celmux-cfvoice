@@ -42,7 +42,12 @@ import {
   normalizeSpeechVoice,
 } from "./voices";
 import { timingSafeTextEqual } from "./auth";
-import { cleanupSFUResources, sfuConfig } from "./sfu-api";
+import {
+  cleanupSFUResources,
+  closeSFUWebSocketAdapters,
+  sfuConfig,
+  type SFUConfig,
+} from "./sfu-api";
 
 const EMPTY_DIGESTS: Record<MediaRole, string> = {
   carrier: "",
@@ -68,6 +73,7 @@ const EMPTY_STATE: PersistedCallState = {
   browserSessionId: "",
   browserTrackMid: "",
   browserDownlinkMid: "",
+  downlinkReady: false,
   pendingDownlinkOfferSdp: "",
   downlinkSessionId: "",
   downlinkTrackName: "",
@@ -137,6 +143,8 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private downlinkResampleSample: number | null = null;
   /** Alarm-backed eviction guard held for the life of one call. */
   private keepAliveDispose: (() => void) | null = null;
+  /** Background creation of the SFU uplink (microphone) adapter. */
+  private uplinkAdapterPromise: Promise<void> | null = null;
   /** Wall-clock anchor for latency diagnostics. */
   private initializedAt = 0;
   private firstCarrierAudioLogged = false;
@@ -298,17 +306,16 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         || !this.state.downlinkTrackName) {
         return new Response("SFU session unavailable", { status: 409 });
       }
-      // The initial tracks request may already include the downlink. Keep
-      // subscribe idempotent so older clients can safely call this endpoint
-      // without triggering a needless retry/error loop.
+      // Keep subscribe idempotent: a retry after a successful bind must not
+      // create a second downlink.
+      if (this.state.downlinkReady) {
+        return Response.json({ status: "ready", already_subscribed: true });
+      }
       if (this.state.pendingDownlinkOfferSdp) {
         return Response.json({
           offer: { type: "offer", sdp: this.state.pendingDownlinkOfferSdp },
           retry: true,
         });
-      }
-      if (this.state.browserDownlinkMid) {
-        return Response.json({ status: "ready", already_subscribed: true });
       }
       const uplinkUrl = body.uplink_url || "";
       const parsedUplink = validRoleUrl(uplinkUrl, "sfu-uplink");
@@ -316,46 +323,28 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         || await digest(parsedUplink.ticket) !== this.state.ticketDigests["sfu-uplink"]) {
         return new Response("Invalid uplink adapter URL", { status: 400 });
       }
-      const createdUplinkAdapter = !this.state.uplinkAdapterId;
-      let uplinkAdapterId = this.state.uplinkAdapterId;
-      if (!uplinkAdapterId) {
-        const uplink = await createSFUWebSocketAdapter(sfu, [{
-          location: "remote",
-          sessionId: this.state.browserSessionId,
-          trackName: "browser-uplink",
-          endpoint: uplinkUrl,
-          outputCodec: "pcm",
-        }]) as {
-          errorCode?: string;
-          errorDescription?: string;
-          tracks?: Array<{
-            trackName?: string;
-            adapterId?: string;
-            errorCode?: string;
-            errorDescription?: string;
-          }>;
-        };
-        const uplinkTrack = uplink.tracks?.[0];
-        if (!uplinkTrack?.adapterId) {
-          const detail = [
-            uplinkTrack?.errorCode || uplink.errorCode,
-            uplinkTrack?.errorDescription || uplink.errorDescription,
-          ].filter(Boolean).join(": ");
-          return new Response(
-            `Uplink adapter unavailable${detail ? `: ${detail}` : ""}`,
-            { status: 502 },
-          );
-        }
-        uplinkAdapterId = uplinkTrack.adapterId;
-        // Persist immediately so a later SFU failure or retry can reuse and
-        // close this adapter instead of creating a second one.
-        this.setState({ ...this.state, uplinkAdapterId });
+      // The uplink adapter carries the browser's microphone to the Agent and
+      // is not needed for the downlink audio the caller hears. Create it in
+      // the background so the caller can be connected as soon as the downlink
+      // is bound.
+      const createdUplinkAdapter = !this.state.uplinkAdapterId && !this.uplinkAdapterPromise;
+      if (createdUplinkAdapter) {
+        this.uplinkAdapterPromise = this.createUplinkAdapter(sfu, uplinkUrl).finally(() => {
+          this.uplinkAdapterPromise = null;
+        });
+        this.ctx.waitUntil(this.uplinkAdapterPromise);
       }
+      // Pull the downlink through the browser's reserved recvonly transceiver
+      // when it exists. The SFU then binds the track to the existing m-line
+      // and no second offer/answer is required.
+      const downlinkMid = this.state.browserDownlinkMid;
       const subscribed = await addSFUTracks(sfu, this.state.browserSessionId, {
         tracks: [{
           location: "remote",
+          ...(downlinkMid ? { mid: downlinkMid } : {}),
           sessionId: this.state.downlinkSessionId,
           trackName: this.state.downlinkTrackName,
+          kind: "audio",
         }],
       }) as {
         sessionDescription?: { type?: string; sdp?: string };
@@ -364,8 +353,17 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       };
       const offer = subscribed.sessionDescription;
       if (!subscribed.requiresImmediateRenegotiation || offer?.type !== "offer" || !offer.sdp) {
-        return new Response("Downlink offer unavailable", { status: 502 });
+        this.setState({ ...this.state, downlinkReady: true, pendingDownlinkOfferSdp: "" });
+        console.info("Celmux subscribe", {
+          sinceInitMs: Date.now() - this.initializedAt,
+          durationMs: Date.now() - subscribeStarted,
+          createdUplinkAdapter,
+          boundToExistingTransceiver: Boolean(downlinkMid),
+        });
+        return Response.json({ status: "ready", downlink_ready: true });
       }
+      // Fallback for a browser without a reserved transceiver: the SFU
+      // returned an offer and the browser has to renegotiate.
       const browserDownlink = subscribed.tracks?.find(
         track => track.trackName === this.state.downlinkTrackName,
       );
@@ -376,12 +374,12 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         ...this.state,
         browserDownlinkMid: browserDownlink.mid,
         pendingDownlinkOfferSdp: offer.sdp,
-        uplinkAdapterId,
       });
       console.info("Celmux subscribe", {
         sinceInitMs: Date.now() - this.initializedAt,
         durationMs: Date.now() - subscribeStarted,
         createdUplinkAdapter,
+        boundToExistingTransceiver: false,
       });
       return Response.json({ offer: { type: "offer", sdp: offer.sdp } });
     }
@@ -397,7 +395,11 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       }
       const renegotiateStarted = Date.now();
       await renegotiateSFUSession(sfu, this.state.browserSessionId, answer.sdp);
-      this.setState({ ...this.state, pendingDownlinkOfferSdp: "" });
+      this.setState({
+        ...this.state,
+        pendingDownlinkOfferSdp: "",
+        downlinkReady: true,
+      });
       console.info("Celmux renegotiate", {
         sinceInitMs: Date.now() - this.initializedAt,
         durationMs: Date.now() - renegotiateStarted,
@@ -1006,6 +1008,51 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     // Transcript durability is complete at this point. Realtime resources are
     // best-effort cleanup and must not delay the result Celmux persists.
     this.ctx.waitUntil(this.closeSfuResources());
+  }
+
+  /**
+   * Create the SFU uplink adapter in the background. It carries the browser's
+   * microphone to the Agent, so the caller's downlink audio path does not
+   * wait for this WebSocket adapter to connect.
+   */
+  private async createUplinkAdapter(sfu: SFUConfig, uplinkUrl: string): Promise<void> {
+    try {
+      const uplink = await createSFUWebSocketAdapter(sfu, [{
+        location: "remote",
+        sessionId: this.state.browserSessionId,
+        trackName: "browser-uplink",
+        endpoint: uplinkUrl,
+        outputCodec: "pcm",
+      }]) as {
+        errorCode?: string;
+        errorDescription?: string;
+        tracks?: Array<{
+          trackName?: string;
+          adapterId?: string;
+          errorCode?: string;
+          errorDescription?: string;
+        }>;
+      };
+      const uplinkTrack = uplink.tracks?.[0];
+      if (!uplinkTrack?.adapterId) {
+        const detail = [
+          uplinkTrack?.errorCode || uplink.errorCode,
+          uplinkTrack?.errorDescription || uplink.errorDescription,
+        ].filter(Boolean).join(": ");
+        this.broadcastControl({
+          type: "error",
+          message: `Uplink adapter unavailable${detail ? `: ${detail}` : ""}`,
+        });
+        return;
+      }
+      if (this.closing || this.state.status !== "ready") {
+        await closeSFUWebSocketAdapters(sfu, [uplinkTrack.adapterId]);
+        return;
+      }
+      this.setState({ ...this.state, uplinkAdapterId: uplinkTrack.adapterId });
+    } catch (error) {
+      this.reportError(error, "Cloudflare 上行适配器创建失败");
+    }
   }
 
   private async closeSfuResources(): Promise<void> {

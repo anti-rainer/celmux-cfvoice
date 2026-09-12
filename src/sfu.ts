@@ -73,6 +73,33 @@ function internalHeaders(env: Env): HeadersInit {
   };
 }
 
+/**
+ * Find the browser's reserved recvonly audio m-line.
+ *
+ * The browser advertises a second audio transceiver in its initial offer.
+ * Pulling the SFU downlink through that existing transceiver by `mid` avoids
+ * a second offer/answer and the multi-second ICE/DTLS round trip it costs.
+ */
+function reservedAudioMid(sdp: string, uplinkMid: string): string {
+  if (!sdp) return "";
+  const mids: string[] = [];
+  let inAudio = false;
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith("m=audio")) {
+      inAudio = true;
+      mids.push("");
+      continue;
+    }
+    if (line.startsWith("m=")) {
+      inAudio = false;
+      continue;
+    }
+    if (!inAudio || !line.startsWith("a=mid:")) continue;
+    mids[mids.length - 1] = line.slice("a=mid:".length).trim();
+  }
+  return mids.find(mid => mid && mid !== uplinkMid) || "";
+}
+
 export async function handleCallApi(request: Request, env: Env): Promise<Response | null> {
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/api/calls")) return null;
@@ -156,6 +183,7 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
     // CRLF. Use trim only for the emptiness check; never mutate the payload.
     const sdp = typeof body.sdp === "string" ? body.sdp : "";
     const mid = body.mid?.trim() || "0";
+    const reservedMid = reservedAudioMid(sdp, mid);
     if ((accessKind === "browser" && !sdp.trim()) || sdp.length > 256 * 1024 || mid.length > 16) {
       return jsonError("invalid_offer", 400, headers);
     }
@@ -245,7 +273,7 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
       body: JSON.stringify({
         browserSessionId: browser.sessionId,
         browserTrackMid: browserTrack?.mid || mid,
-        browserDownlinkMid: "",
+        browserDownlinkMid: reservedMid,
         downlinkSessionId: downlinkTrack.sessionId,
         downlinkTrackName: downlinkTrack.trackName,
         downlinkTrackMid: downlinkTrack.mid || "",
