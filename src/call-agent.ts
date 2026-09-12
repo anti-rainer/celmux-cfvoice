@@ -137,6 +137,9 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private downlinkResampleSample: number | null = null;
   /** Alarm-backed eviction guard held for the life of one call. */
   private keepAliveDispose: (() => void) | null = null;
+  /** Wall-clock anchor for latency diagnostics. */
+  private initializedAt = 0;
+  private firstCarrierAudioLogged = false;
   /** Consecutive silent 20 ms frames while a realtime session is open. */
   private realtimeIdleFrames: Record<CaptionDirection, number> = { incoming: 0, outgoing: 0 };
   /** Recent frames replayed when a lazy realtime session starts. */
@@ -242,6 +245,8 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       const speechVoice = normalizeSpeechVoice(speechModel, features.speechVoice);
       this.closing = false;
       this.closeTask = null;
+      this.initializedAt = Date.now();
+      this.firstCarrierAudioLogged = false;
       this.keepAliveDispose?.();
       this.keepAliveDispose = await this.keepAlive();
       this.sttRetryAt = { incoming: 0, outgoing: 0 };
@@ -285,6 +290,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     }
     if (path.endsWith("/subscribe") && request.method === "POST") {
       const body = await request.json<{ uplink_url?: string }>();
+      const subscribeStarted = Date.now();
       const sfu = sfuConfig(this.env);
       if (!sfu
         || !this.state.browserSessionId
@@ -310,6 +316,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         || await digest(parsedUplink.ticket) !== this.state.ticketDigests["sfu-uplink"]) {
         return new Response("Invalid uplink adapter URL", { status: 400 });
       }
+      const createdUplinkAdapter = !this.state.uplinkAdapterId;
       let uplinkAdapterId = this.state.uplinkAdapterId;
       if (!uplinkAdapterId) {
         const uplink = await createSFUWebSocketAdapter(sfu, [{
@@ -371,6 +378,11 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         pendingDownlinkOfferSdp: offer.sdp,
         uplinkAdapterId,
       });
+      console.info("Celmux subscribe", {
+        sinceInitMs: Date.now() - this.initializedAt,
+        durationMs: Date.now() - subscribeStarted,
+        createdUplinkAdapter,
+      });
       return Response.json({ offer: { type: "offer", sdp: offer.sdp } });
     }
     if (path.endsWith("/renegotiate") && request.method === "POST") {
@@ -383,8 +395,13 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       if (!sfu || !this.state.browserSessionId || !this.state.browserDownlinkMid) {
         return new Response("SFU subscription unavailable", { status: 409 });
       }
+      const renegotiateStarted = Date.now();
       await renegotiateSFUSession(sfu, this.state.browserSessionId, answer.sdp);
       this.setState({ ...this.state, pendingDownlinkOfferSdp: "" });
+      console.info("Celmux renegotiate", {
+        sinceInitMs: Date.now() - this.initializedAt,
+        durationMs: Date.now() - renegotiateStarted,
+      });
       return Response.json({ status: "ready" });
     }
     if (path.endsWith("/close") && request.method === "POST") {
@@ -409,6 +426,10 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     connection.setState({ role, authorized: true });
     if (role === "control") this.sendControl(connection, { type: "ready" });
     if (role === "carrier") await this.cancelAutoClose();
+    console.info("Celmux connect", {
+      role,
+      sinceInitMs: Date.now() - this.initializedAt,
+    });
   }
 
   getConnectionTags(_connection: Connection, context: ConnectionContext): string[] {
@@ -431,6 +452,12 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
 
   private handleCarrierAudio(audio: ArrayBuffer): void {
     if (!audio.byteLength || audio.byteLength % PCM16_20MS_BYTES !== 0) return;
+    if (!this.firstCarrierAudioLogged) {
+      this.firstCarrierAudioLogged = true;
+      console.info("Celmux first carrier audio", {
+        sinceInitMs: Date.now() - this.initializedAt,
+      });
+    }
     // Original conversation audio is the real-time path. Never put an AI
     // provider send ahead of it: a congested STT socket must not delay audio.
     // Celmux has already decoded and (when necessary) repaired the carrier

@@ -146,6 +146,7 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
   const createdTracks: Array<{ sessionId: string; mids: string[] }> = [];
   const body = await readJson<OpenCallBody>(request);
   if (!body) return jsonError("invalid_json", 400, headers);
+  const openStarted = Date.now();
   try {
     const accessKind = body.access_kind || "browser";
     if (accessKind !== "browser" && accessKind !== "sip" && accessKind !== "automatic") {
@@ -254,6 +255,10 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
       }),
     });
 
+    console.info("Celmux open", {
+      accessKind,
+      durationMs: Date.now() - openStarted,
+    });
     return Response.json({
       ...baseResponse,
       uplink_url: roleUrl("sfu-uplink"),
