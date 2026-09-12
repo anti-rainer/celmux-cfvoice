@@ -9,7 +9,7 @@ Browser (Realtime SFU) / SIP RTP bridge / automatic answer
 CelmuxCallAgent (one Agent / Durable Object per call)
   ├─ bounded 48 kHz stereo ↔ 16 kHz mono PCM routing
   ├─ Workers AI continuous STT or Whisper large-v3-turbo chunked STT and translation
-  ├─ Aura-1 raw 16 kHz PCM streaming TTS
+  ├─ Aura-1 / Aura-2 raw 16 kHz PCM streaming TTS
   ├─ durable caption records
   └─ role-scoped WebSocket tickets and SFU cleanup
         ↕ carrier role            ↕ access role
@@ -86,14 +86,24 @@ Workers Logs 中保留结构化日志（`observability.head_sampling_rate: 1`）
   后检测到换气/语气停顿时结束片段，再提交至
   `@cf/openai/whisper-large-v3-turbo`，不再按固定秒数盲切。翻译、字幕保存及
   上行译音共用同一处理链。
+- 实时 Flux 会话按语音活动懒启动：某个方向出现人声才建立 WebSocket，连续
+  20 秒数字静音后关闭，并保留 300 ms 预卷保护首音节。这样通话中的长静音、
+  等待和只听不说的方向不再持续消耗流式额度。分片模式只在 VAD 检测到语句时
+  调用 Whisper，本身已是低成本路径。
+- 文本翻译默认使用 `@cf/zai-org/glm-4.7-flash`，失败时回退到
+  `@cf/meta/llama-3.2-3b-instruct`。两者按 token 计费，电话短句的翻译成本
+  远低于流式 STT（$0.0077/分钟）和 Aura TTS；免费额度主要由 Flux 和 Aura
+  决定。
 - 开启上行语音翻译后，Agent 停止透传我方原音，将 Flux 断句翻译到配置的
   对方语言；选择自动识别时使用英语，再请求 Aura-1 的 `linear16`、
   `container:none`、16 kHz 原始音频。
   Aura 的任意网络分片会重组为每帧 640 字节，并按 20 ms 节奏送入 IMS 媒体桥。
 - 上行译音按句串行，失败的句子只报告一次且不重试；来话方向永远播放原音，
   不请求或播放译音。自动接听也不会启用上行译音，以免欢迎语被二次处理。
-- 上行译音可在 Celmux 中选择 Aura-1 的模型专属音色角色（男女声分组）；该音色
-  只影响 Cloudflare 语音系统，不会混用本地语音系统的 Voice ID。
+- 上行译音可在 Celmux 中选择 Aura-1 / Aura-2 English / Aura-2 Spanish 的
+  模型专属音色（男女声分组）；该音色只影响 Cloudflare 语音系统，不会混用本地
+  语音系统的 Voice ID。Aura-2 的字符计费约为 Aura-1 的 2 倍（$0.03 对
+  $0.015 每 1k 字符），免费额度紧张时建议保持 Aura-1。
 - Cloudflare 语音系统设置页提供转文字、文本翻译和语音输出三个效果测试，
   测试直接调用 Agent 的 `/api/test`，不会创建通话、SFU 会话或写入通话字幕。
 - 队列拥塞时丢弃实时帧，不积压后重放。

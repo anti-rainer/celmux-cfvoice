@@ -8,7 +8,9 @@ export type CallFeatureConfig = {
   transcriptionMode: "realtime" | "chunked";
   translation: boolean;
   speechTranslation: boolean;
-  /** Deepgram Aura-1 speaker; voices are model-specific. */
+  /** Workers AI speech model, for example `@cf/deepgram/aura-1`. */
+  speechModel: string;
+  /** Speaker for the selected model; voices are model-specific. */
   speechVoice: string;
   sourceLanguage: string;
   targetLanguage: string;
@@ -20,6 +22,8 @@ export type PersistedCallState = CallFeatureConfig & {
   status: "new" | "ready" | "closed";
   accessKind: CallAccessKind;
   ticketDigests: Record<MediaRole, string>;
+  /** Durable alarm that closes a call whose carrier never (re)connected. */
+  autoCloseScheduleId: string;
   browserSessionId: string;
   browserTrackMid: string;
   browserDownlinkMid: string;

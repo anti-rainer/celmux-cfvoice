@@ -7,6 +7,7 @@ import { authorized, corsHeaders, jsonError, readJson } from "./auth";
 import type { CallAccessKind, CallFeatureConfig, RoleTickets } from "./protocol";
 import { cleanupSFUResources, sfuConfig, type SFUConfig } from "./sfu-api";
 import { normalizeLanguage, translate } from "./providers";
+import { normalizeSpeechModel, normalizeSpeechVoice } from "./voices";
 
 type AdapterTrack = {
   sessionId?: string;
@@ -40,6 +41,7 @@ type VoiceTestBody = {
   audio_base64?: string;
   text?: string;
   target_language?: string;
+  model?: string;
   voice?: string;
   language?: string;
   translate?: boolean;
@@ -168,6 +170,8 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
       && transcription
       && body.features?.speechTranslation === true
       && targetLanguage.toLowerCase() !== "auto";
+    const speechModel = normalizeSpeechModel(body.features?.speechModel);
+    const speechVoice = normalizeSpeechVoice(speechModel, body.features?.speechVoice);
     const initialized = await callAgent.fetch("https://agent.internal/initialize", {
       method: "POST",
       headers: internalHeaders(env),
@@ -178,6 +182,8 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
           transcriptionMode,
           translation: transcription && body.features?.translation === true,
           speechTranslation,
+          speechModel,
+          speechVoice,
           sourceLanguage,
           targetLanguage,
           accessKind,
@@ -305,11 +311,10 @@ export async function handleVoiceTestApi(request: Request, env: Env): Promise<Re
       const text = typeof body.text === "string" ? body.text.trim() : "";
       const language = typeof body.language === "string" ? body.language.trim() : "en";
       const speechText = body.translate === true ? await translate(env.AI, text, language) : text;
-      const voice = typeof body.voice === "string" && /^[a-z][a-z0-9_-]{1,31}$/i.test(body.voice.trim())
-        ? body.voice.trim().toLowerCase()
-        : "asteria";
+      const model = normalizeSpeechModel(body.model);
+      const voice = normalizeSpeechVoice(model, body.voice);
       if (!text || text.length > 4_096) return jsonError("invalid_text", 400, headers);
-      const response = await (env.AI.run as unknown as (model: string, input: unknown, options: unknown) => Promise<Response>)("@cf/deepgram/aura-1", {
+      const response = await (env.AI.run as unknown as (model: string, input: unknown, options: unknown) => Promise<Response>)(model, {
         text: speechText || text,
         speaker: voice,
         encoding: "linear16",
@@ -318,7 +323,7 @@ export async function handleVoiceTestApi(request: Request, env: Env): Promise<Re
       }, { returnRawResponse: true });
       if (!response.ok || !response.body) return jsonError(`speech_failed_${response.status}`, 502, headers);
       const bytes = new Uint8Array(await response.arrayBuffer());
-      return Response.json({ status: "ok", voice, language, sample_rate: 16_000, audio_base64: bytesToBase64(bytes) }, { headers });
+      return Response.json({ status: "ok", model, voice, language, sample_rate: 16_000, audio_base64: bytesToBase64(bytes) }, { headers });
     }
     return jsonError("invalid_test_kind", 400, headers);
   } catch (error) {

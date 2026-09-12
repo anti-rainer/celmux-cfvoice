@@ -13,7 +13,9 @@ import {
   PCM16_20MS_BYTES,
   asArrayBuffer,
   roleFromUrl,
+  type CallAccessKind,
   type CaptionDirection,
+  type CallFeatureConfig,
   type ConnectionState,
   type MediaRole,
   type PersistedCallState,
@@ -31,10 +33,14 @@ import {
 import {
   explicitLanguage,
   normalizeLanguage,
-  normalizeSpeechVoice,
   outgoingTranslationLanguage,
   translate,
 } from "./providers";
+import {
+  DEFAULT_SPEECH_MODEL,
+  normalizeSpeechModel,
+  normalizeSpeechVoice,
+} from "./voices";
 import { timingSafeTextEqual } from "./auth";
 import { cleanupSFUResources, sfuConfig } from "./sfu-api";
 
@@ -50,10 +56,12 @@ const EMPTY_STATE: PersistedCallState = {
   status: "new",
   accessKind: "browser",
   ticketDigests: EMPTY_DIGESTS,
+  autoCloseScheduleId: "",
   transcription: false,
   transcriptionMode: "realtime",
   translation: false,
   speechTranslation: false,
+  speechModel: DEFAULT_SPEECH_MODEL,
   speechVoice: "asteria",
   sourceLanguage: "auto",
   targetLanguage: "zh",
@@ -68,9 +76,21 @@ const EMPTY_STATE: PersistedCallState = {
   uplinkAdapterId: "",
 };
 
+/** Close a call whose carrier leg disappeared without a Celmux DELETE. */
+const CARRIER_GRACE_SECONDS = 45;
+/** Close a freshly initialized call that never opens its carrier leg. */
+const INITIAL_CONNECT_GRACE_SECONDS = 60;
+/**
+ * Realtime Flux is billed per streaming audio minute. Only hold a session
+ * while its direction has speech; 300 ms of pre-roll protects the first
+ * phoneme and 20 s of continuous silence closes an idle direction.
+ */
+const REALTIME_PREROLL_FRAMES = 15;
+const REALTIME_IDLE_CLOSE_FRAMES = 1_000;
+
 type InitializeBody = {
   tickets: RoleTickets;
-  features: Partial<PersistedCallState>;
+  features: Partial<CallFeatureConfig> & { accessKind?: CallAccessKind };
 };
 
 type ResourceBody = Pick<PersistedCallState,
@@ -117,6 +137,10 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private downlinkResampleSample: number | null = null;
   /** Alarm-backed eviction guard held for the life of one call. */
   private keepAliveDispose: (() => void) | null = null;
+  /** Consecutive silent 20 ms frames while a realtime session is open. */
+  private realtimeIdleFrames: Record<CaptionDirection, number> = { incoming: 0, outgoing: 0 };
+  /** Recent frames replayed when a lazy realtime session starts. */
+  private realtimePreRoll: Record<CaptionDirection, Uint8Array[]> = { incoming: [], outgoing: [] };
 
   shouldSendProtocolMessages(): boolean {
     return false;
@@ -128,6 +152,9 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     // constructor fields were reset.
     if (this.state.status === "ready" && !this.keepAliveDispose) {
       this.keepAliveDispose = await this.keepAlive();
+    }
+    if (this.state.status === "ready" && !this.hasOpenCarrier()) {
+      await this.scheduleAutoClose(CARRIER_GRACE_SECONDS);
     }
   }
 
@@ -148,6 +175,42 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       reason: reason || undefined,
       wasClean,
     });
+    if (state?.role === "carrier" && this.state.status === "ready" && !this.closing) {
+      void this.scheduleAutoClose(CARRIER_GRACE_SECONDS);
+    }
+  }
+
+  private hasOpenCarrier(): boolean {
+    for (const connection of this.getConnections<ConnectionState>("carrier")) {
+      if (connection.readyState === WebSocket.OPEN) return true;
+    }
+    return false;
+  }
+
+  private async scheduleAutoClose(seconds: number): Promise<void> {
+    await this.cancelAutoClose();
+    const scheduled = await this.schedule(seconds, "autoCloseCall", undefined, {
+      idempotent: true,
+    });
+    this.setState({ ...this.state, autoCloseScheduleId: scheduled.id });
+  }
+
+  private async cancelAutoClose(): Promise<void> {
+    const id = this.state.autoCloseScheduleId;
+    if (!id) return;
+    try {
+      await this.cancelSchedule(id);
+    } catch {
+      // The alarm may already have fired; there is nothing left to cancel.
+    }
+    this.setState({ ...this.state, autoCloseScheduleId: "" });
+  }
+
+  async autoCloseCall(): Promise<void> {
+    if (this.state.status !== "ready" || this.closing) return;
+    if (this.hasOpenCarrier()) return;
+    console.warn("Celmux call auto-closing after carrier disconnect", { callId: this.name });
+    await this.closeCall();
   }
 
   private ensureCaptionTable(): void {
@@ -175,7 +238,8 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       const transcriptionMode = features.transcriptionMode === "chunked" ? "chunked" : "realtime";
       const sourceLanguage = normalizeLanguage(features.sourceLanguage, "auto");
       const targetLanguage = normalizeLanguage(features.targetLanguage, "zh-CN");
-      const speechVoice = normalizeSpeechVoice(features.speechVoice);
+      const speechModel = normalizeSpeechModel(features.speechModel);
+      const speechVoice = normalizeSpeechVoice(speechModel, features.speechVoice);
       this.closing = false;
       this.closeTask = null;
       this.keepAliveDispose?.();
@@ -186,13 +250,14 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       this.recentSpeechAt = { incoming: 0, outgoing: 0 };
       this.chunkBuffers = { incoming: new Uint8Array(0), outgoing: new Uint8Array(0) };
       this.chunkTails = { incoming: Promise.resolve(), outgoing: Promise.resolve() };
+      this.realtimeIdleFrames = { incoming: 0, outgoing: 0 };
+      this.realtimePreRoll = { incoming: [], outgoing: [] };
       this.resetChunkVad();
       this.lastChunkText = { incoming: "", outgoing: "" };
       this.pendingCaptions = [];
       this.downlinkResampleSample = null;
       this.setState({
         ...EMPTY_STATE,
-        ...features,
         status: "ready",
         ticketDigests: digests,
         accessKind,
@@ -205,18 +270,12 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
           && explicitLanguage(targetLanguage),
         sourceLanguage,
         targetLanguage,
+        speechModel,
         speechVoice,
       });
-      if (transcription && transcriptionMode === "realtime") {
-        // Start both streaming recognizers while the signalling/SFU path is
-        // being prepared. The first spoken frame must not pay model startup
-        // latency, and a transient failed socket is recreated by feed().
-        const sessions = [this.transcriber("incoming"), this.transcriber("outgoing")]
-          .filter((session): session is TranscriberSession => session !== null);
-        this.ctx.waitUntil(Promise.allSettled(sessions.map(
-          session => session.waitUntilReady?.() ?? Promise.resolve(),
-        )));
-      }
+      // The carrier leg is expected to connect immediately. If it never
+      // does, the durable alarm closes the call instead of leaving a zombie.
+      await this.scheduleAutoClose(INITIAL_CONNECT_GRACE_SECONDS);
       return Response.json({ status: "ready" });
     }
     if (path.endsWith("/resources") && request.method === "POST") {
@@ -349,6 +408,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     }
     connection.setState({ role, authorized: true });
     if (role === "control") this.sendControl(connection, { type: "ready" });
+    if (role === "carrier") await this.cancelAutoClose();
   }
 
   getConnectionTags(_connection: Connection, context: ConnectionContext): string[] {
@@ -404,18 +464,63 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private feed(direction: CaptionDirection, audio: ArrayBuffer): void {
     if (!this.state.transcription) return;
     this.audioFrames[direction] += audio.byteLength / PCM16_20MS_BYTES;
-    if (hasLikelySpeechFrame(new Uint8Array(audio))) {
-      this.recentSpeechAt[direction] = Date.now();
-    }
     if (this.state.transcriptionMode === "chunked") {
+      if (hasLikelySpeechFrame(new Uint8Array(audio))) {
+        this.recentSpeechAt[direction] = Date.now();
+      }
       this.feedChunked(direction, audio);
       return;
     }
-    const session = this.transcriber(direction);
-    if (!session) return;
+    this.feedRealtime(direction, audio);
+  }
+
+  /**
+   * Realtime Flux is billed per streaming audio minute, and the old path held
+   * two sessions open for the whole call. Start a direction's session on its
+   * first voiced frame, replay a short pre-roll, and close it after 20 s of
+   * continuous silence. Celmux sends 20 ms frames continuously (including
+   * digital silence), so silence itself is the idle timer.
+   */
+  private feedRealtime(direction: CaptionDirection, audio: ArrayBuffer): void {
     for (let offset = 0; offset + PCM16_20MS_BYTES <= audio.byteLength; offset += PCM16_20MS_BYTES) {
-      session.feed(audio.slice(offset, offset + PCM16_20MS_BYTES));
+      const frame = new Uint8Array(audio.slice(offset, offset + PCM16_20MS_BYTES));
+      const voiced = hasLikelySpeechFrame(frame);
+      if (voiced) {
+        this.recentSpeechAt[direction] = Date.now();
+        this.realtimeIdleFrames[direction] = 0;
+      } else if (this.realtimeIdleFrames[direction] < REALTIME_IDLE_CLOSE_FRAMES) {
+        this.realtimeIdleFrames[direction] += 1;
+      }
+      const existing = direction === "incoming" ? this.incomingSTT : this.outgoingSTT;
+      if (!existing) {
+        // Do not open a Flux socket during digital silence: the free tier is
+        // spent per streaming minute even when no text is produced.
+        const preRoll = this.realtimePreRoll[direction];
+        preRoll.push(frame);
+        if (preRoll.length > REALTIME_PREROLL_FRAMES) preRoll.shift();
+        if (!voiced) continue;
+        const session = this.transcriber(direction);
+        if (!session) continue;
+        for (const buffered of preRoll) session.feed(buffered.buffer as ArrayBuffer);
+        preRoll.length = 0;
+        continue;
+      }
+      existing.feed(frame.buffer as ArrayBuffer);
+      if (!voiced && this.realtimeIdleFrames[direction] >= REALTIME_IDLE_CLOSE_FRAMES) {
+        this.closeRealtimeSession(direction);
+      }
     }
+  }
+
+  private closeRealtimeSession(direction: CaptionDirection): void {
+    const session = direction === "incoming" ? this.incomingSTT : this.outgoingSTT;
+    if (!session) return;
+    session.close();
+    if (direction === "incoming") this.incomingSTT = null;
+    else this.outgoingSTT = null;
+    this.realtimeIdleFrames[direction] = 0;
+    this.realtimePreRoll[direction] = [];
+    this.pendingInterim[direction] = "";
   }
 
   /** Feed short independent PCM chunks to Whisper at the edge.  The media
@@ -647,30 +752,33 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         message: "Cloudflare 上行语音翻译需要开启转文字并明确选择我的语言",
       });
     }
-    if (transcriptionMode !== this.state.transcriptionMode) {
-      this.incomingSTT?.close();
-      this.outgoingSTT?.close();
-      this.incomingSTT = null;
-      this.outgoingSTT = null;
+    const speechModel = value.speechModel === undefined
+      ? this.state.speechModel
+      : normalizeSpeechModel(value.speechModel);
+    const speechVoice = normalizeSpeechVoice(
+      speechModel,
+      value.speechVoice === undefined ? this.state.speechVoice : value.speechVoice,
+    );
+    if (transcriptionMode !== this.state.transcriptionMode || !transcription) {
+      this.closeRealtimeSession("incoming");
+      this.closeRealtimeSession("outgoing");
       this.chunkBuffers = { incoming: new Uint8Array(0), outgoing: new Uint8Array(0) };
       this.resetChunkVad();
       this.lastChunkText = { incoming: "", outgoing: "" };
     }
-    if (speechTranslation !== this.state.speechTranslation) this.speechGeneration += 1;
+    if (speechTranslation !== this.state.speechTranslation
+      || speechModel !== this.state.speechModel) {
+      this.speechGeneration += 1;
+    }
     this.setState({
       ...this.state,
       transcription,
       transcriptionMode,
       translation: transcription && value.translation === true,
       speechTranslation,
-      speechVoice: value.speechVoice === undefined
-        ? this.state.speechVoice
-        : normalizeSpeechVoice(value.speechVoice),
+      speechModel,
+      speechVoice,
     });
-    if (transcription && transcriptionMode === "realtime") {
-      this.transcriber("incoming");
-      this.transcriber("outgoing");
-    }
   }
 
   private outgoingSpeechReplacementEnabled(): boolean {
@@ -682,7 +790,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
 
   private async streamTranslatedSpeech(text: string, generation: number): Promise<void> {
     if (!this.speechStreamActive(generation)) return;
-    const response = await (this.env.AI.run as unknown as (model: string, input: unknown, options: unknown) => Promise<Response>)("@cf/deepgram/aura-1", {
+    const response = await (this.env.AI.run as unknown as (model: string, input: unknown, options: unknown) => Promise<Response>)(this.state.speechModel, {
       text,
       speaker: this.state.speechVoice || "asteria",
       encoding: "linear16",
@@ -821,6 +929,7 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     this.speechGeneration += 1;
     this.keepAliveDispose?.();
     this.keepAliveDispose = null;
+    await this.cancelAutoClose();
     // Flux emits the last utterance after end-of-turn detection. Keep the
     // transcription sockets alive for that one final grace
     // interval after Celmux has stopped sending PCM, then close exactly once.
