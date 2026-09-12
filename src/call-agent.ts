@@ -759,6 +759,23 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       });
       return;
     }
+    if (value.type === "speak") {
+      // Text typed into the caption board. It replaces the microphone exactly
+      // like a spoken sentence: translate to the carrier's language, then
+      // synthesize and pace it onto the carrier socket.
+      const text = typeof value.text === "string" ? value.text.trim().slice(0, 1_000) : "";
+      if (!text) return;
+      if (!this.outgoingSpeechReplacementEnabled()) {
+        this.reportError(new Error("上行译音未开启"), "Cloudflare 语音合成失败");
+        return;
+      }
+      console.info("Celmux typed speech", {
+        sinceInitMs: Date.now() - this.initializedAt,
+        characters: text.length,
+      });
+      this.scheduleCaption("outgoing", text);
+      return;
+    }
     if (value.type !== "features") return;
     const transcription = value.transcription === true;
     const transcriptionMode = value.transcriptionMode === undefined
