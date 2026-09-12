@@ -103,6 +103,9 @@ type ResourceBody = Pick<PersistedCallState,
   "browserSessionId" | "browserTrackMid" | "browserDownlinkMid" | "downlinkSessionId" |
   "downlinkTrackName" | "downlinkTrackMid" | "downlinkAdapterId" | "uplinkAdapterId">;
 
+/** Result of pulling the carrier downlink into the browser's session. */
+type DownlinkBind = { status: "ready" } | { status: "offer"; sdp: string };
+
 /**
  * One Agent owns one call. It is both the bounded PCM router and the durable
  * AI processor; no browser-only voice pipeline or second room object exists.
@@ -145,6 +148,8 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   private keepAliveDispose: (() => void) | null = null;
   /** Background creation of the SFU uplink (microphone) adapter. */
   private uplinkAdapterPromise: Promise<void> | null = null;
+  /** Background bind of the carrier downlink into the browser session. */
+  private downlinkBind: Promise<DownlinkBind> | null = null;
   /** Wall-clock anchor for latency diagnostics. */
   private initializedAt = 0;
   private firstCarrierAudioLogged = false;
@@ -294,6 +299,18 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     if (path.endsWith("/resources") && request.method === "POST") {
       const body = await request.json<ResourceBody>();
       this.setState({ ...this.state, ...body });
+      const sfu = sfuConfig(this.env);
+      // Start the SFU track operation as soon as the browser session exists.
+      // The SFU blocks it until that session is connected, and the browser only
+      // calls subscribe after it is connected — running the operation in the
+      // background removes that serialised wait from the dial path.
+      if (sfu
+        && this.state.browserSessionId
+        && this.state.downlinkSessionId
+        && this.state.downlinkTrackName
+        && !this.state.downlinkReady) {
+        this.ctx.waitUntil(this.bindDownlink(sfu).catch(() => undefined));
+      }
       return Response.json({ status: "saved" });
     }
     if (path.endsWith("/subscribe") && request.method === "POST") {
@@ -334,54 +351,19 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
         });
         this.ctx.waitUntil(this.uplinkAdapterPromise);
       }
-      // Pull the downlink through the browser's reserved recvonly transceiver
-      // when it exists. The SFU then binds the track to the existing m-line
-      // and no second offer/answer is required.
-      const downlinkMid = this.state.browserDownlinkMid;
-      const subscribed = await addSFUTracks(sfu, this.state.browserSessionId, {
-        tracks: [{
-          location: "remote",
-          ...(downlinkMid ? { mid: downlinkMid } : {}),
-          sessionId: this.state.downlinkSessionId,
-          trackName: this.state.downlinkTrackName,
-          kind: "audio",
-        }],
-      }) as {
-        sessionDescription?: { type?: string; sdp?: string };
-        requiresImmediateRenegotiation?: boolean;
-        tracks?: Array<{ trackName?: string; mid?: string }>;
-      };
-      const offer = subscribed.sessionDescription;
-      if (!subscribed.requiresImmediateRenegotiation || offer?.type !== "offer" || !offer.sdp) {
-        this.setState({ ...this.state, downlinkReady: true, pendingDownlinkOfferSdp: "" });
-        console.info("Celmux subscribe", {
-          sinceInitMs: Date.now() - this.initializedAt,
-          durationMs: Date.now() - subscribeStarted,
-          createdUplinkAdapter,
-          boundToExistingTransceiver: Boolean(downlinkMid),
-        });
-        return Response.json({ status: "ready", downlink_ready: true });
-      }
-      // Fallback for a browser without a reserved transceiver: the SFU
-      // returned an offer and the browser has to renegotiate.
-      const browserDownlink = subscribed.tracks?.find(
-        track => track.trackName === this.state.downlinkTrackName,
-      );
-      if (!browserDownlink?.mid) {
-        return new Response("Downlink track mid unavailable", { status: 502 });
-      }
-      this.setState({
-        ...this.state,
-        browserDownlinkMid: browserDownlink.mid,
-        pendingDownlinkOfferSdp: offer.sdp,
-      });
+      const prebound = this.downlinkBind !== null;
+      const bind = await this.bindDownlink(sfu);
       console.info("Celmux subscribe", {
         sinceInitMs: Date.now() - this.initializedAt,
         durationMs: Date.now() - subscribeStarted,
         createdUplinkAdapter,
-        boundToExistingTransceiver: false,
+        prebound,
+        requiresRenegotiation: bind.status === "offer",
       });
-      return Response.json({ offer: { type: "offer", sdp: offer.sdp } });
+      if (bind.status === "offer") {
+        return Response.json({ offer: { type: "offer", sdp: bind.sdp } });
+      }
+      return Response.json({ status: "ready", downlink_ready: true });
     }
     if (path.endsWith("/renegotiate") && request.method === "POST") {
       const body = await request.json<{ answer?: { type?: string; sdp?: string } }>();
@@ -765,6 +747,18 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     try { message = JSON.parse(raw); } catch { return; }
     if (!message || typeof message !== "object") return;
     const value = message as Record<string, unknown>;
+    if (value.type === "diag") {
+      // Browser-side phase timings and failures. The dial path is dominated by
+      // the browser's own handshakes, so the Agent records what only the
+      // browser can observe.
+      console.info("Celmux browser diag", {
+        sinceInitMs: Date.now() - this.initializedAt,
+        kind: value.kind,
+        phases: value.phases,
+        error: value.error,
+      });
+      return;
+    }
     if (value.type !== "features") return;
     const transcription = value.transcription === true;
     const transcriptionMode = value.transcriptionMode === undefined
@@ -1008,6 +1002,67 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     // Transcript durability is complete at this point. Realtime resources are
     // best-effort cleanup and must not delay the result Celmux persists.
     this.ctx.waitUntil(this.closeSfuResources());
+  }
+
+  /**
+   * Pull the carrier downlink into the browser's session.
+   *
+   * The SFU has to negotiate its own m-line for the track: binding it to the
+   * browser's reserved recvonly transceiver answers `sendonly` and reports
+   * `requiresImmediateRenegotiation:false`, yet the SFU then never sends a
+   * single RTP packet on that m-line (measured: inbound-rtp stays at 0 bytes
+   * while carrier audio is flowing), so the caller hears nothing.
+   */
+  private bindDownlink(sfu: SFUConfig): Promise<DownlinkBind> {
+    if (this.downlinkBind) return this.downlinkBind;
+    const started = Date.now();
+    const task = (async (): Promise<DownlinkBind> => {
+      const subscribed = await addSFUTracks(sfu, this.state.browserSessionId, {
+        tracks: [{
+          location: "remote",
+          sessionId: this.state.downlinkSessionId,
+          trackName: this.state.downlinkTrackName,
+          kind: "audio",
+        }],
+      }) as {
+        sessionDescription?: { type?: string; sdp?: string };
+        requiresImmediateRenegotiation?: boolean;
+        tracks?: Array<{ trackName?: string; mid?: string }>;
+      };
+      // Never trim an SDP: Chrome rejects a description whose last line has no
+      // CRLF terminator, and the SFU's offer ends with a direction attribute.
+      const offerSdp = subscribed.requiresImmediateRenegotiation === true
+        ? subscribed.sessionDescription?.sdp || ""
+        : "";
+      let result: DownlinkBind = { status: "ready" };
+      if (offerSdp.trim()) {
+        const browserDownlink = subscribed.tracks?.find(
+          track => track.trackName === this.state.downlinkTrackName,
+        );
+        if (!browserDownlink?.mid) throw new Error("downlink_track_mid_unavailable");
+        this.setState({
+          ...this.state,
+          browserDownlinkMid: browserDownlink.mid,
+          pendingDownlinkOfferSdp: offerSdp,
+        });
+        result = { status: "offer", sdp: offerSdp };
+      } else {
+        this.setState({ ...this.state, downlinkReady: true, pendingDownlinkOfferSdp: "" });
+      }
+      console.info("Celmux downlink bind", {
+        sinceInitMs: Date.now() - this.initializedAt,
+        durationMs: Date.now() - started,
+        boundMid: subscribed.tracks?.[0]?.mid || "",
+        requiresRenegotiation: result.status === "offer",
+      });
+      return result;
+    })();
+    this.downlinkBind = task;
+    // A failed bind must stay retryable for the next subscribe attempt.
+    void task.catch(() => {
+      if (this.downlinkBind === task) this.downlinkBind = null;
+    });
+    return task;
   }
 
   /**
