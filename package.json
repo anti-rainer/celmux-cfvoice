@@ -3,22 +3,29 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "wrangler dev",
+    "check": "npm run typecheck && npm run types:check && npm test && wrangler deploy --dry-run",
     "deploy": "wrangler deploy --keep-vars",
+    "deploy:dry": "wrangler deploy --dry-run",
     "setup": "bash ./scripts/setup.sh",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "types": "wrangler types"
+    "types": "wrangler types --include-runtime false worker-configuration.d.ts",
+    "types:check": "wrangler types --include-runtime false --check worker-configuration.d.ts"
   },
   "dependencies": {
-    "@cloudflare/voice": "^0.4.0",
-    "agents": "^0.22.0",
-    "ai": "^7.0.92"
+    "agents": "0.23.0"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260911.1",
     "@types/node": "^24.3.0",
     "typescript": "^5.8.2",
-    "wrangler": "^4.30.0"
+    "vitest": "^5.0.0",
+    "wrangler": "^4.131.1"
   },
   "cloudflare": {
     "bindings": {

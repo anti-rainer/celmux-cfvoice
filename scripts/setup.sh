@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+
 if ! command -v npx >/dev/null 2>&1; then
-  echo "需要 Node.js 18 或更高版本和 npm。" >&2
+  echo "需要 Node.js 22 或更高版本和 npm。" >&2
   exit 1
 fi
 
@@ -12,9 +14,20 @@ npx wrangler whoami >/dev/null 2>&1 || {
   npx wrangler login
 }
 
-echo "依次输入 Secret。输入不会显示，也不会写入仓库。"
+# Build and validate before touching secrets so a broken change fails fast.
+npm run typecheck
+npx wrangler deploy --dry-run
+
+# `secret list` prints names only; values are never read back. Existing
+# secrets are reused so a redeploy does not force re-entering them.
+existing=$(npx wrangler secret list 2>/dev/null || true)
 for name in CELMUX_AGENT_TOKEN CLOUDFLARE_SFU_APP_ID CLOUDFLARE_SFU_API_TOKEN; do
-  npx wrangler secret put "$name"
+  if printf '%s' "$existing" | grep -q "$name"; then
+    echo "Secret $name 已存在，跳过。"
+  else
+    echo "设置 Secret $name（输入不会显示）："
+    npx wrangler secret put "$name"
+  fi
 done
 
 npm run deploy

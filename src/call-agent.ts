@@ -8,7 +8,7 @@ import {
   createSFUWebSocketAdapter,
   renegotiateSFUSession,
   type TranscriberSession,
-} from "@cloudflare/voice";
+} from "agents/voice";
 import {
   PCM16_20MS_BYTES,
   asArrayBuffer,
@@ -19,8 +19,24 @@ import {
   type PersistedCallState,
   type RoleTickets,
 } from "./protocol";
+import {
+  appendBytes,
+  containsLikelySpeech,
+  hasLikelySpeechFrame,
+  pcmLevel,
+  pcmToWavBase64,
+  softenPcmStart,
+  upsample16kMonoTo48kStereoLinear,
+} from "./audio";
+import {
+  explicitLanguage,
+  normalizeLanguage,
+  normalizeSpeechVoice,
+  outgoingTranslationLanguage,
+  translate,
+} from "./providers";
 import { timingSafeTextEqual } from "./auth";
-import { cleanupSFUResources, type SFUConfig } from "./sfu-api";
+import { cleanupSFUResources, sfuConfig } from "./sfu-api";
 
 const EMPTY_DIGESTS: Record<MediaRole, string> = {
   carrier: "",
@@ -99,9 +115,51 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     occurredAt: string;
   }> = [];
   private downlinkResampleSample: number | null = null;
+  /** Alarm-backed eviction guard held for the life of one call. */
+  private keepAliveDispose: (() => void) | null = null;
 
   shouldSendProtocolMessages(): boolean {
     return false;
+  }
+
+  async onStart(): Promise<void> {
+    this.ensureCaptionTable();
+    // A wake during a live call must re-arm the eviction guard even though
+    // constructor fields were reset.
+    if (this.state.status === "ready" && !this.keepAliveDispose) {
+      this.keepAliveDispose = await this.keepAlive();
+    }
+  }
+
+  onError(connectionOrError: Connection | unknown, error?: unknown): void {
+    const detail = error ?? connectionOrError;
+    console.error("Celmux call agent error", {
+      message: detail instanceof Error ? detail.message : String(detail),
+    });
+    if (error !== undefined) super.onError(connectionOrError as Connection, error);
+    else super.onError(connectionOrError);
+  }
+
+  onClose(connection: Connection, code: number, reason: string, wasClean: boolean): void {
+    const state = connection.state as ConnectionState | undefined;
+    console.info("Celmux call connection closed", {
+      role: state?.role ?? "unknown",
+      code,
+      reason: reason || undefined,
+      wasClean,
+    });
+  }
+
+  private ensureCaptionTable(): void {
+    this.sql`
+      CREATE TABLE IF NOT EXISTS call_captions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        direction TEXT NOT NULL,
+        text TEXT NOT NULL,
+        translated_text TEXT NOT NULL,
+        occurred_at TEXT NOT NULL
+      )
+    `;
   }
 
   async onRequest(request: Request): Promise<Response> {
@@ -120,6 +178,8 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       const speechVoice = normalizeSpeechVoice(features.speechVoice);
       this.closing = false;
       this.closeTask = null;
+      this.keepAliveDispose?.();
+      this.keepAliveDispose = await this.keepAlive();
       this.sttRetryAt = { incoming: 0, outgoing: 0 };
       this.pendingInterim = { incoming: "", outgoing: "" };
       this.audioFrames = { incoming: 0, outgoing: 0 };
@@ -548,15 +608,6 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
       translated_text: translatedText,
       occurred_at: new Date().toISOString(),
     };
-    this.sql`
-      CREATE TABLE IF NOT EXISTS call_captions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        direction TEXT NOT NULL,
-        text TEXT NOT NULL,
-        translated_text TEXT NOT NULL,
-        occurred_at TEXT NOT NULL
-      )
-    `;
     this.pendingCaptions.push({
       direction,
       text: clean,
@@ -730,15 +781,6 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   }
 
   private callResult(): object {
-    this.sql`
-      CREATE TABLE IF NOT EXISTS call_captions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        direction TEXT NOT NULL,
-        text TEXT NOT NULL,
-        translated_text TEXT NOT NULL,
-        occurred_at TEXT NOT NULL
-      )
-    `;
     for (const caption of this.pendingCaptions) {
       this.sql`
         INSERT INTO call_captions (direction, text, translated_text, occurred_at)
@@ -777,6 +819,8 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     // after the carrier leg has ended can exceed Celmux's bounded close window.
     this.closing = true;
     this.speechGeneration += 1;
+    this.keepAliveDispose?.();
+    this.keepAliveDispose = null;
     // Flux emits the last utterance after end-of-turn detection. Keep the
     // transcription sockets alive for that one final grace
     // interval after Celmux has stopped sending PCM, then close exactly once.
@@ -809,15 +853,6 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
     // before Celmux receives the final call result.
     await Promise.resolve();
     await Promise.allSettled([...this.captionJobs]);
-    this.sql`
-      CREATE TABLE IF NOT EXISTS call_captions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        direction TEXT NOT NULL,
-        text TEXT NOT NULL,
-        translated_text TEXT NOT NULL,
-        occurred_at TEXT NOT NULL
-      )
-    `;
     for (const caption of this.pendingCaptions) {
       this.sql`
         INSERT INTO call_captions (direction, text, translated_text, occurred_at)
@@ -860,178 +895,8 @@ export class CelmuxCallAgent extends Agent<Env, PersistedCallState> {
   }
 }
 
-/** Apply a tiny (2 ms) linear fade-in to each synthesized utterance. Some TTS
- * providers begin a PCM response at a non-zero sample, which is heard as a
- * short click immediately before every translated phrase. */
-function softenPcmStart(frame: Uint8Array): void {
-  const samples = Math.min(32, Math.floor(frame.byteLength / 2));
-  const view = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-  for (let index = 0; index < samples; index += 1) {
-    const gain = index / samples;
-    view.setInt16(index * 2, Math.round(view.getInt16(index * 2, true) * gain), true);
-  }
-}
-
-function sfuConfig(env: Env): SFUConfig | null {
-  const appId = (env.CLOUDFLARE_SFU_APP_ID || env.CLOUDFLARE_REALTIME_APP_ID)?.trim();
-  const apiToken = (env.CLOUDFLARE_SFU_API_TOKEN || env.CLOUDFLARE_REALTIME_API_TOKEN)?.trim();
-  return appId && apiToken ? { appId, apiToken } : null;
-}
-
 function validAccessKind(value: unknown): value is PersistedCallState["accessKind"] {
   return value === "browser" || value === "sip" || value === "automatic";
-}
-
-function normalizeLanguage(value: unknown, fallback: string): string {
-  if (typeof value !== "string" || !value.trim()) return fallback;
-  const normalized = value.trim().replaceAll("_", "-").toLowerCase();
-  // Whisper accepts ISO-639-1 language codes (zh, en, ...), not regional
-  // BCP-47 tags such as zh-CN. Keep the Agent state in this canonical form so
-  // both realtime Flux and chunked Whisper receive the same value.
-  if (normalized === "auto") return "auto";
-  if (normalized.startsWith("zh")) return "zh";
-  return normalized.split("-", 1)[0] || fallback;
-}
-
-function explicitLanguage(value: string): boolean {
-  return Boolean(value.trim()) && value.trim().toLowerCase() !== "auto";
-}
-
-/**
- * `sourceLanguage` describes the remote party. Automatic detection remains
- * valid for incoming transcription, but synthesized uplink speech needs a
- * concrete target immediately. English is the deterministic default until a
- * remote language is selected explicitly.
- */
-function outgoingTranslationLanguage(sourceLanguage: string): string {
-  return explicitLanguage(sourceLanguage) ? sourceLanguage.trim() : "en";
-}
-
-function appendBytes(
-  left: Uint8Array<ArrayBufferLike>,
-  right: Uint8Array<ArrayBufferLike>,
-): Uint8Array<ArrayBuffer> {
-  if (!right.byteLength) return left as Uint8Array<ArrayBuffer>;
-  const combined = new Uint8Array(left.byteLength + right.byteLength);
-  combined.set(left);
-  combined.set(right, left.byteLength);
-  return combined;
-}
-
-type PcmLevel = { rms: number; span: number };
-
-function pcmLevel(pcm: Uint8Array, offset: number, length: number): PcmLevel {
-  const samples = Math.floor(length / 2);
-  if (!samples) return { rms: 0, span: 0 };
-  const view = new DataView(pcm.buffer, pcm.byteOffset + offset, samples * 2);
-  let sum = 0;
-  let minimum = 32_767;
-  let maximum = -32_768;
-  for (let index = 0; index < samples; index += 1) {
-    const sample = view.getInt16(index * 2, true);
-    sum += sample;
-    minimum = Math.min(minimum, sample);
-    maximum = Math.max(maximum, sample);
-  }
-  const mean = sum / samples;
-  let squares = 0;
-  for (let index = 0; index < samples; index += 1) {
-    const centered = view.getInt16(index * 2, true) - mean;
-    squares += centered * centered;
-  }
-  return { rms: Math.sqrt(squares / samples), span: maximum - minimum };
-}
-
-function hasLikelySpeechFrame(pcm: Uint8Array): boolean {
-  for (let offset = 0; offset + PCM16_20MS_BYTES <= pcm.byteLength; offset += PCM16_20MS_BYTES) {
-    const level = pcmLevel(pcm, offset, PCM16_20MS_BYTES);
-    if (level.rms >= 160 && level.span >= 800) return true;
-  }
-  return false;
-}
-
-/** Conservative pre-inference VAD for independent Whisper chunks. Four
- * voiced 20 ms frames are enough to retain short words, while isolated PCM
- * clicks and idle microphone noise never reach the generative decoder. */
-function containsLikelySpeech(pcm: Uint8Array): boolean {
-  const levels: PcmLevel[] = [];
-  for (let offset = 0; offset + PCM16_20MS_BYTES <= pcm.byteLength; offset += PCM16_20MS_BYTES) {
-    levels.push(pcmLevel(pcm, offset, PCM16_20MS_BYTES));
-  }
-  if (levels.length < 4) return false;
-  const sortedRms = levels.map(level => level.rms).sort((left, right) => left - right);
-  const noiseFloor = sortedRms[Math.floor(sortedRms.length * 0.2)] || 0;
-  const threshold = Math.max(140, Math.min(600, noiseFloor * 2 + 60));
-  let voicedFrames = 0;
-  let maximumRms = 0;
-  let maximumSpan = 0;
-  for (const level of levels) {
-    maximumRms = Math.max(maximumRms, level.rms);
-    maximumSpan = Math.max(maximumSpan, level.span);
-    if (level.rms >= threshold && level.span >= 800) voicedFrames += 1;
-  }
-  return voicedFrames >= 4 && maximumRms >= 220 && maximumSpan >= 1_000;
-}
-
-/** Convert one or more 16 kHz mono PCM frames to 48 kHz stereo PCM.
- *
- * The SFU adapter consumes signed little-endian PCM.  A sample-and-hold 3x
- * expansion is technically valid, but its staircase edges contain a strong
- * image in the telephone band and make consonant onsets sound like a tiny
- * burst.  Linear interpolation keeps the same exact 20 ms clock while
- * removing that artificial high-frequency component.
- */
-function upsample16kMonoTo48kStereoLinear(
-  mono16k: ArrayBuffer,
-  previousSample: number | null,
-): { audio: Uint8Array; lastSample: number | null } {
-  const input = new DataView(mono16k);
-  const sampleCount = Math.floor(mono16k.byteLength / 2);
-  const output = new Uint8Array(sampleCount * 3 * 4);
-  const view = new DataView(output.buffer);
-  let previous = previousSample;
-  for (let index = 0; index < sampleCount; index += 1) {
-    const current = input.getInt16(index * 2, true);
-    const from = previous ?? current;
-    const values = [
-      Math.round((from * 2 + current) / 3),
-      Math.round((from + current * 2) / 3),
-      current,
-    ];
-    for (let phase = 0; phase < 3; phase += 1) {
-      const offset = (index * 3 + phase) * 4;
-      view.setInt16(offset, values[phase], true);
-      view.setInt16(offset + 2, values[phase], true);
-    }
-    previous = current;
-  }
-  return { audio: output, lastSample: previous };
-}
-
-function pcmToWavBase64(pcm: Uint8Array): string {
-  const wav = new Uint8Array(44 + pcm.byteLength);
-  const view = new DataView(wav.buffer);
-  const write = (offset: number, value: string) => {
-    for (let index = 0; index < value.length; index += 1) wav[offset + index] = value.charCodeAt(index);
-  };
-  write(0, "RIFF");
-  view.setUint32(4, 36 + pcm.byteLength, true);
-  write(8, "WAVEfmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, 16_000, true);
-  view.setUint32(28, 32_000, true);
-  view.setUint16(32, 2, true);
-  view.setUint16(34, 16, true);
-  write(36, "data");
-  view.setUint32(40, pcm.byteLength, true);
-  wav.set(pcm, 44);
-  let binary = "";
-  for (let offset = 0; offset < wav.byteLength; offset += 0x8000) {
-    binary += String.fromCharCode(...wav.subarray(offset, Math.min(offset + 0x8000, wav.byteLength)));
-  }
-  return btoa(binary);
 }
 
 function validTickets(tickets: RoleTickets | undefined): tickets is RoleTickets {
@@ -1069,24 +934,4 @@ function validRoleUrl(value: string, role: MediaRole): { ticket: string } | null
   } catch {
     return null;
   }
-}
-
-export async function translate(ai: Ai, text: string, target: string): Promise<string> {
-  if (!target || target.toLowerCase() === "auto") return "";
-  const result = await ai.run("@cf/meta/llama-3.2-3b-instruct", {
-    messages: [
-      { role: "system", content: `Translate telephone speech to ${target}. Return only the translation.` },
-      { role: "user", content: text },
-    ],
-    max_tokens: 256,
-    temperature: 0,
-  });
-  if (!result || typeof result !== "object" || !("response" in result)) return "";
-  return String((result as { response?: unknown }).response || "").trim();
-}
-
-function normalizeSpeechVoice(value: unknown): string {
-  if (typeof value !== "string" || !value.trim()) return "asteria";
-  const voice = value.trim().toLowerCase();
-  return /^[a-z][a-z0-9_-]{1,31}$/.test(voice) ? voice : "asteria";
 }

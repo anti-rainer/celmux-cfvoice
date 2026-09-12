@@ -31,3 +31,12 @@ export function timingSafeTextEqual(actual: string, expected: string): boolean {
 export function jsonError(message: string, status: number, headers: HeadersInit = {}): Response {
   return Response.json({ error: message }, { status, headers });
 }
+
+/** Parse a JSON request body without turning a client mistake into a 502. */
+export async function readJson<T>(request: Request): Promise<T | null> {
+  try {
+    return await request.json<T>();
+  } catch {
+    return null;
+  }
+}

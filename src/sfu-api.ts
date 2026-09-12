@@ -2,6 +2,12 @@ const SFU_API_BASE = "https://rtc.live.cloudflare.com/v1";
 
 export type SFUConfig = { appId: string; apiToken: string };
 
+export function sfuConfig(env: Env): SFUConfig | null {
+  const appId = (env.CLOUDFLARE_SFU_APP_ID || env.CLOUDFLARE_REALTIME_APP_ID)?.trim();
+  const apiToken = (env.CLOUDFLARE_SFU_API_TOKEN || env.CLOUDFLARE_REALTIME_API_TOKEN)?.trim();
+  return appId && apiToken ? { appId, apiToken } : null;
+}
+
 export type SFUTrackRef = { sessionId: string; mids: string[] };
 
 export async function closeSFUWebSocketAdapters(config: SFUConfig, adapterIds: string[]): Promise<void> {

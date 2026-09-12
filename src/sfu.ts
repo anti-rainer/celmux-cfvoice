@@ -2,11 +2,11 @@ import {
   addSFUTracks,
   createSFUSession,
   createSFUWebSocketAdapter,
-} from "@cloudflare/voice";
-import { authorized, corsHeaders, jsonError } from "./auth";
+} from "agents/voice";
+import { authorized, corsHeaders, jsonError, readJson } from "./auth";
 import type { CallAccessKind, CallFeatureConfig, RoleTickets } from "./protocol";
-import { cleanupSFUResources, type SFUConfig } from "./sfu-api";
-import { translate } from "./call-agent";
+import { cleanupSFUResources, sfuConfig, type SFUConfig } from "./sfu-api";
+import { normalizeLanguage, translate } from "./providers";
 
 type AdapterTrack = {
   sessionId?: string;
@@ -44,12 +44,6 @@ type VoiceTestBody = {
   language?: string;
   translate?: boolean;
 };
-
-function config(env: Env): SFUConfig | null {
-  const appId = (env.CLOUDFLARE_SFU_APP_ID || env.CLOUDFLARE_REALTIME_APP_ID)?.trim();
-  const apiToken = (env.CLOUDFLARE_SFU_API_TOKEN || env.CLOUDFLARE_REALTIME_API_TOKEN)?.trim();
-  return appId && apiToken ? { appId, apiToken } : null;
-}
 
 function ticket(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -102,8 +96,9 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
 
   const renegotiateMatch = url.pathname.match(/^\/api\/calls\/([0-9a-f-]+)\/renegotiate$/i);
   if (renegotiateMatch && request.method === "POST") {
+    const body = await readJson<RenegotiateBody>(request);
+    if (!body) return jsonError("invalid_json", 400, headers);
     try {
-      const body = await request.json<RenegotiateBody>();
       const response = await agent(env, renegotiateMatch[1]).fetch("https://agent.internal/renegotiate", {
         method: "POST",
         headers: internalHeaders(env),
@@ -122,8 +117,9 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
 
   const subscribeMatch = url.pathname.match(/^\/api\/calls\/([0-9a-f-]+)\/subscribe$/i);
   if (subscribeMatch && request.method === "POST") {
+    const body = await readJson<SubscribeBody>(request);
+    if (!body) return jsonError("invalid_json", 400, headers);
     try {
-      const body = await request.json<SubscribeBody>();
       const response = await agent(env, subscribeMatch[1]).fetch("https://agent.internal/subscribe", {
         method: "POST",
         headers: internalHeaders(env),
@@ -146,8 +142,9 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
   let createdSfu: SFUConfig | null = null;
   const createdAdapterIds: string[] = [];
   const createdTracks: Array<{ sessionId: string; mids: string[] }> = [];
+  const body = await readJson<OpenCallBody>(request);
+  if (!body) return jsonError("invalid_json", 400, headers);
   try {
-    const body = await request.json<OpenCallBody>();
     const accessKind = body.access_kind || "browser";
     if (accessKind !== "browser" && accessKind !== "sip" && accessKind !== "automatic") {
       return jsonError("invalid_access_kind", 400, headers);
@@ -204,7 +201,7 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
       return Response.json(baseResponse, { headers });
     }
 
-    const sfu = config(env);
+    const sfu = sfuConfig(env);
     if (!sfu) throw new Error("sfu_not_configured");
     createdSfu = sfu;
     // Allocate sequentially so every successful resource is visible to the
@@ -282,8 +279,9 @@ export async function handleVoiceTestApi(request: Request, env: Env): Promise<Re
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers });
   if (request.method !== "POST") return jsonError("method_not_allowed", 405, headers);
   if (!authorized(request, env.CELMUX_AGENT_TOKEN)) return jsonError("unauthorized", 401, headers);
+  const body = await readJson<VoiceTestBody>(request);
+  if (!body) return jsonError("invalid_json", 400, headers);
   try {
-    const body = await request.json<VoiceTestBody>();
     const kind = body.kind;
     if (kind === "translation") {
       const text = typeof body.text === "string" ? body.text.trim() : "";
@@ -334,12 +332,4 @@ function bytesToBase64(bytes: Uint8Array): string {
     output += String.fromCharCode(...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.byteLength)));
   }
   return btoa(output);
-}
-
-function normalizeLanguage(value: unknown, fallback: string): string {
-  if (typeof value !== "string" || !value.trim()) return fallback;
-  const normalized = value.trim().replaceAll("_", "-").toLowerCase();
-  if (normalized === "auto") return "auto";
-  if (normalized.startsWith("zh")) return "zh";
-  return normalized.split("-", 1)[0] || fallback;
 }

@@ -51,13 +51,27 @@ Celmux 自己管理 IMS、SIP、票据和界面。
 
 ## 部署配置
 
+推荐使用脚本完成首次部署。脚本会安装依赖、检查 Wrangler 登录、运行类型检查与
+dry-run、只为缺失项设置 Secret，最后部署：
+
+```sh
+npm run setup
+```
+
+手动部署：
+
 ```sh
 npm ci
+npm run check
 npx wrangler secret put CELMUX_AGENT_TOKEN
 npx wrangler secret put CLOUDFLARE_SFU_API_TOKEN
 npx wrangler secret put CLOUDFLARE_SFU_APP_ID
 npm run deploy
 ```
+
+`npm run check` 等价于 `tsc --noEmit` 加 `wrangler deploy --dry-run`，用于在
+真正的部署前发现类型或 Worker 配置问题。部署后的 Worker 在 Cloudflare
+Workers Logs 中保留结构化日志（`observability.head_sampling_rate: 1`）。
 
 - `CELMUX_AGENT_TOKEN`：只供 Celmux 后端调用 Worker 管理 API。
 - `CLOUDFLARE_SFU_APP_ID`：SFU 应用的 App ID，用于 Worker 连接 Serverless SFU。
@@ -93,3 +107,37 @@ npm run deploy
 也可以运行 `npm run setup` 自动安装依赖、检查 Wrangler 登录状态并逐项设置 Secret。
 脚本输出的 `workers.dev` 地址只适合临时验证；正式使用前请在 Cloudflare 控制台绑定
 自定义域名，再把该 HTTPS 地址填入 Celmux。
+
+## 实现参考
+
+本 Worker 的语音管线、SFU 适配器和部署方式与以下官方实现保持对齐：
+
+- [Agents SDK 官方 voice-agent 示例](https://github.com/cloudflare/agents/tree/main/examples/voice-agent)：
+  Realtime SFU + Workers AI Flux 的完整参考实现，本项目的 `sfu.ts`、`WorkersAIFluxSTT`
+  用法参考自该示例。
+- [Agents SDK voice 源码](https://github.com/cloudflare/agents/tree/main/packages/agents/src/voice)：
+  `agents/voice` 的 SFU 辅助函数、音频格式转换和 provider 实现。本项目已从已废弃的
+  `@cloudflare/voice` 兼容包迁移到该路径。
+- [Realtime SFU WebSocket adapter](https://developers.cloudflare.com/realtime/sfu/media-transport-adapters/websocket-adapter/)：
+  `buffer`（WebSocket→WebRTC，32 KB/消息）与 stream（WebRTC→WebSocket，PCM 48 kHz
+  立体声 protobuf）模式的协议和生命周期说明。
+- [Plivo voice agent 示例](https://github.com/cloudflare/agents/tree/main/examples/plivo-voice-agent)：
+  电话接入和 `wrangler deploy` 后自动读取部署地址的脚本模式。
+
+依赖说明：`agents` 的 voice API 仍标记为实验性，必须锁定版本升级；旧
+`@cloudflare/voice` 包只是兼容转发层，不应继续出现在新代码中。翻译与 TTS 仍直接
+使用 Workers AI binding，因为实时译音需要原始 16 kHz PCM，而 `WorkersAITTS`
+返回的 MP3 无法在 Workers 运行时解码为 PCM。
+
+## 维护者：从 Celmux 主仓库同步
+
+`celmux-cfvoice` 是 Celmux 主仓库 `cloudflare/voice-interpretation-worker` 的
+subtree 镜像。修改请提交到主仓库，然后在主仓库执行：
+
+```sh
+./scripts/push-cfvoice.sh
+```
+
+脚本使用 `git subtree split` 生成只包含该目录的提交，并推送到 cfvoice 仓库的
+`main` 分支；推送后 Cloudflare Workers Builds 会按仓库配置自动构建部署。不要把
+Secret、`.dev.vars` 或 `node_modules` 提交进任一仓库。
