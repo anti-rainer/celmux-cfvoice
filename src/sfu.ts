@@ -195,8 +195,11 @@ export async function handleCallApi(request: Request, env: Env): Promise<Respons
     const transcriptionMode = body.features?.transcriptionMode === "chunked" ? "chunked" : "realtime";
     const sourceLanguage = normalizeLanguage(body.features?.sourceLanguage, "auto");
     const targetLanguage = normalizeLanguage(body.features?.targetLanguage, "zh");
-    const speechTranslation = accessKind !== "automatic"
-      && transcription
+    // Automatic answering is a voicemail leg, but it is still a full media
+    // session: the caller's speech must be transcribed and translated, and a
+    // text/TTS injection from the Celmux UI has to reach the caller. The three
+    // feature switches decide, not the access kind.
+    const speechTranslation = transcription
       && body.features?.speechTranslation === true
       && targetLanguage.toLowerCase() !== "auto";
     const speechModel = normalizeSpeechModel(body.features?.speechModel);
